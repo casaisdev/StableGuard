@@ -262,7 +262,7 @@ contract PriceOracleTest is Test {
         console2.log("- Fallback price in USD:");
         console2.logUint(fallbackPrice / 1e18);
 
-        assertEq(fallbackPrice, 1500 * 1e18); // Debe usar el fallback de $1500
+        assertEq(fallbackPrice, 1500 * 1e18); // Must use the $1500 fallback
 
         console2.log("TEST COMPLETED: PriceOracle works correctly with Chainlink");
         console2.log("");
@@ -425,7 +425,7 @@ contract PriceOracleTest is Test {
     function testDecimalConversions() public {
         console2.log("=== TEST DECIMAL CONVERSION ===");
 
-        // Test con diferentes decimales de aggregators
+        // Test with aggregators of different decimals
         address token6 = address(0x60);
         address token18 = address(0x180);
 

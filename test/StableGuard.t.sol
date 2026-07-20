@@ -665,7 +665,7 @@ contract StableGuardTest is Test {
     }
 
     function test_StableGuard_ReceiveETH_Success() public {
-        // StableGuard debe aceptar ETH via receive()
+        // StableGuard must accept ETH via receive()
         vm.deal(address(this), 1 ether);
         (bool success,) = address(stableGuard).call{value: 1 ether}("");
         assertTrue(success);
