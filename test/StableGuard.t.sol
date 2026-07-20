@@ -10,6 +10,8 @@ import {IDutchAuctionManager} from "../src/interfaces/IDutchAuctionManager.sol";
 import {Constants} from "../src/Constants.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IRepegManager} from "../src/interfaces/IRepegManager.sol";
+import {Timelock} from "../src/Timelock.sol";
+import {RateLimiter} from "../src/RateLimiter.sol";
 import {console} from "forge-std/console.sol";
 
 // =====================
@@ -90,6 +92,12 @@ contract MockPriceOracle is IPriceOracle {
         return (amount * price) / (10 ** dec);
     }
 
+    function getTokenAmountFromUsd(address token, uint256 usdValue) external view returns (uint256) {
+        require(supported[token], "Token not supported");
+        uint8 dec = tokenDecimals[token] == 0 ? 18 : tokenDecimals[token];
+        return (usdValue * (10 ** dec)) / prices[token];
+    }
+
     // Unused in these tests but required by interface
     function getTokenPrice(address token) external view returns (uint256) {
         return prices[token];
@@ -102,8 +110,7 @@ contract MockPriceOracle is IPriceOracle {
     function configureToken(address, address, uint256, uint8) external {}
     function removeToken(address) external {}
     function batchConfigureTokens(address[] calldata, address[] calldata, uint256[] calldata, uint8[] calldata)
-        external
-    {}
+        external {}
 
     function getSupportedTokens() external pure returns (address[] memory) {
         address[] memory a;
@@ -160,22 +167,22 @@ contract MockCollateralManager is ICollateralManager {
         totalCollateralValue[user] = value;
     }
 
-    function addCollateralType(address, address, uint256, uint8, uint16, uint16, uint16) external {}
+    function addCollateralType(address, address, uint256, uint8) external {}
 
     function deposit(address user, address token, uint256 amount) external payable {
         userCollateral[user][token] += amount;
         setUserCollateral(user, token, userCollateral[user][token]);
     }
 
-    function withdraw(address user, address token, uint256 amount) external {
+    function withdraw(address user, address token, uint256 amount, address recipient) external {
         require(userCollateral[user][token] >= amount, "Insufficient collateral");
         userCollateral[user][token] -= amount;
-        // Simulate real CollateralManager behavior: send assets to caller (StableGuard)
+        // Simulate real CollateralManager behavior: pay the recipient directly
         if (token == Constants.ETH_TOKEN) {
-            (bool success,) = payable(msg.sender).call{value: amount}("");
+            (bool success,) = payable(recipient).call{value: amount}("");
             require(success, "ETH forward failed");
         } else {
-            bool ok = IERC20(token).transfer(msg.sender, amount);
+            bool ok = IERC20(token).transfer(recipient, amount);
             require(ok, "Transfer failed");
         }
     }
@@ -239,23 +246,6 @@ contract MockLiquidationManager is ILiquidationManager {
         return optimalToken;
     }
 
-    function liquidateDirect(address, uint256) external view returns (bool) {
-        return shouldSucceed;
-    }
-
-    function liquidateDirect(address, address, uint256) external view returns (bool) {
-        return shouldSucceed;
-    }
-
-    // Unused in these tests but satisfy interface
-    function liquidate(address, uint256) external pure returns (bool) {
-        return true;
-    }
-
-    function liquidate(address, address, uint256) external pure returns (bool) {
-        return true;
-    }
-
     function isLiquidatable(address) external pure returns (bool) {
         return true;
     }
@@ -317,8 +307,13 @@ contract MockDutchAuctionManager is IDutchAuctionManager {
         return counter;
     }
 
-    function getAuction(uint256) external pure returns (DutchAuction memory) {
-        revert("not implemented");
+    function getAuction(uint256) external view returns (DutchAuction memory auction) {
+        // Mirror the real contract: return a populated struct for the last auction
+        auction.user = last.user;
+        auction.token = last.token;
+        auction.debtAmount = uint96(last.debt);
+        auction.active = counter > 0;
+        auction.tokenDecimals = 18;
     }
 
     function getConfig() external pure returns (uint64, uint64, uint64) {
@@ -329,7 +324,7 @@ contract MockDutchAuctionManager is IDutchAuctionManager {
         return 0;
     }
 
-    function bidOnAuction(uint256, uint256) external payable returns (bool) {
+    function bidOnAuction(uint256, uint256) external returns (bool) {
         return false;
     }
 
@@ -338,8 +333,14 @@ contract MockDutchAuctionManager is IDutchAuctionManager {
         return new uint256[](0);
     }
 
-    function getUserTokenAuction(address, address) external pure returns (uint256) {
-        return 0;
+    mapping(address => mapping(address => uint256)) public activeUserTokenAuction;
+
+    function setUserTokenAuction(address user, address token, uint256 auctionId) external {
+        activeUserTokenAuction[user][token] = auctionId;
+    }
+
+    function getUserTokenAuction(address user, address token) external view returns (uint256) {
+        return activeUserTokenAuction[user][token];
     }
 
     function cleanExpiredAuctions(uint256[] calldata) external pure returns (uint256) {
@@ -380,7 +381,12 @@ contract MockRepegManager is IRepegManager {
     bool public paused;
 
     // Core functions
-    function checkAndTriggerRepeg() external returns (bool triggered, uint128 newPrice) {
+    function checkAndTriggerRepeg(
+        address /* beneficiary */
+    )
+        external
+        returns (bool triggered, uint128 newPrice)
+    {
         state.inProgress = false;
         return (true, state.currentPrice);
     }
@@ -401,7 +407,14 @@ contract MockRepegManager is IRepegManager {
     }
 
     // Arbitrage functions
-    function executeArbitrage(uint256 amount, uint128 /* maxSlippage */ ) external payable returns (uint128 profit) {
+    function executeArbitrage(
+        uint256 amount,
+        uint128 /* maxSlippage */
+    )
+        external
+        payable
+        returns (uint128 profit)
+    {
         return uint128(amount / 100);
     }
 
@@ -432,6 +445,13 @@ contract MockRepegManager is IRepegManager {
         return true;
     }
 
+    function withdrawEthLiquidity(uint256 amount) external returns (bool success) {
+        require(availableLiquidity >= amount && totalLiquidity >= amount, "insufficient");
+        totalLiquidity -= amount;
+        availableLiquidity -= amount;
+        return true;
+    }
+
     // Configuration functions
     function updateRepegConfig(RepegConfig calldata newConfig) external {
         config = newConfig;
@@ -445,7 +465,12 @@ contract MockRepegManager is IRepegManager {
         config.deviationThreshold = newThreshold;
     }
 
-    function updateIncentiveParameters(uint16 rate, uint128 /* maxIncentive */ ) external {
+    function updateIncentiveParameters(
+        uint16 rate,
+        uint128 /* maxIncentive */
+    )
+        external
+    {
         config.incentiveRate = rate;
     }
 
@@ -466,7 +491,13 @@ contract MockRepegManager is IRepegManager {
         return (50, true);
     }
 
-    function calculateIncentive(address /* caller */ ) external pure returns (uint128 incentive) {
+    function calculateIncentive(
+        address /* caller */
+    )
+        external
+        pure
+        returns (uint128 incentive)
+    {
         return 10;
     }
 
@@ -474,7 +505,9 @@ contract MockRepegManager is IRepegManager {
         return (totalLiquidity, availableLiquidity);
     }
 
-    function getRepegHistory(uint256 /* count */ )
+    function getRepegHistory(
+        uint256 /* count */
+    )
         external
         view
         returns (uint128[] memory prices, uint64[] memory timestamps)
@@ -513,6 +546,7 @@ contract StableGuardTest is Test {
     address public user = address(0x111);
     address public liquidator = address(0x222);
     address public repeg = address(0x333); // dummy non-zero address
+    address public timelock; // impersonated for governance calls in tests
 
     function setUp() public {
         // Ensure timestamp is far from zero to avoid cooldown triggering on first op
@@ -535,13 +569,18 @@ contract StableGuardTest is Test {
         priceOracle.setTokenDecimals(address(mockToken), 18);
         priceOracle.setTokenPrice(address(mockToken), 1e18); // $1 per token
 
+        // A plain address stands in for the Timelock: governance calls are made by
+        // pranking it. The Timelock's own queue/execute flow is covered in Timelock.t.sol.
+        timelock = makeAddr("timelock");
+
         // Deploy StableGuard
         stableGuard = new StableGuard(
             address(priceOracle),
             address(collateralManager),
             address(liquidationManager),
             address(auctionManager),
-            address(repegManager)
+            address(repegManager),
+            timelock
         );
 
         // Reset rate-limiting state to a clean slate for tests
@@ -578,6 +617,21 @@ contract StableGuardTest is Test {
         StableGuard.UserPosition memory pos = stableGuard.getUserPosition(user);
         assertEq(pos.debt, mintAmount);
         assertEq(collateralManager.getUserCollateral(user, Constants.ETH_TOKEN), depositAmount);
+    }
+
+    function test_GetLiquidationThreshold_ReadsPackedConfig() public {
+        uint256 depositAmount = 1 ether;
+        uint256 mintAmount = 1000e18;
+        collateralManager.setTotalCollateralValue(user, 0);
+        vm.deal(user, depositAmount);
+
+        vm.prank(user);
+        stableGuard.depositAndMint{value: depositAmount}(Constants.ETH_TOKEN, depositAmount, mintAmount);
+
+        // Default liquidationThreshold = 12000 bps -> debt * 1.2 (the old assembly
+        // version read the priceOracle address slot instead of the config)
+        assertEq(stableGuard.getLiquidationThreshold(user), (mintAmount * 12000) / 10000);
+        assertEq(stableGuard.getLiquidationThreshold(makeAddr("nobody")), 0);
     }
 
     function test_DepositAndMint_Token_Success() public {
@@ -655,7 +709,7 @@ contract StableGuardTest is Test {
         stableGuard.liquidate(user, address(mockToken), 10e18);
     }
 
-    function test_EmergencyLiquidate_Failure_RevertsWithMessage() public {
+    function test_EmergencyLiquidate_RevertWithoutSgdAllowance() public {
         // Setup position
         uint256 depositAmount = 200e18;
         uint256 mintAmount = 100e18;
@@ -666,27 +720,16 @@ contract StableGuardTest is Test {
         stableGuard.depositAndMint(address(mockToken), depositAmount, mintAmount);
         vm.stopPrank();
 
-        // Give StableGuard contract tokens to burn
-        vm.prank(user);
-        bool okTransfer1 = stableGuard.transfer(address(stableGuard), 50e18);
-        assertTrue(okTransfer1, "ERC20 transfer failed");
-
-        // Make liquidation manager fail
-        liquidationManager.setShouldSucceed(false);
-
-        // Owner calls emergencyLiquidate and expects revert
-        vm.expectRevert("Liquidation failed");
+        // The owner must supply the SGD being retired; without allowance it reverts
+        vm.expectRevert();
         vm.prank(owner);
-        stableGuard.emergencyLiquidate(user, 50e18);
-
-        // Reset flag for other tests
-        liquidationManager.setShouldSucceed(true);
+        stableGuard.emergencyLiquidate(user, address(mockToken), 50e18);
     }
 
     function test_UpdateModules_InvalidAddresses_Revert() public {
         // Zero address for one of the modules should revert
         vm.expectRevert("Invalid addresses");
-        vm.prank(owner);
+        vm.prank(timelock);
         stableGuard.updateModules(
             address(priceOracle),
             address(collateralManager),
@@ -722,7 +765,7 @@ contract StableGuardTest is Test {
         vm.warp(block.timestamp + 5 minutes + 1);
 
         // Log initial global rate limit state
-        StableGuard.GlobalRateLimit memory grlStart = stableGuard.getGlobalRateLimit();
+        RateLimiter.GlobalRateLimit memory grlStart = stableGuard.getGlobalRateLimit();
         console.log("[GlobalRL] start ts:", block.timestamp);
         console.log("[GlobalRL] windowStart:", uint256(grlStart.globalWindowStart));
         console.log("[GlobalRL] opCount:", uint256(grlStart.globalOperationCount));
@@ -736,7 +779,7 @@ contract StableGuardTest is Test {
             vm.prank(addr);
             stableGuard.depositAndMint{value: depositAmount}(Constants.ETH_TOKEN, depositAmount, mintAmount);
             if (i % 200 == 0) {
-                StableGuard.GlobalRateLimit memory grlMid = stableGuard.getGlobalRateLimit();
+                RateLimiter.GlobalRateLimit memory grlMid = stableGuard.getGlobalRateLimit();
                 console.log("[GlobalRL] after", i + 1, "ops, ts:", block.timestamp);
                 console.log("[GlobalRL] opCount:", uint256(grlMid.globalOperationCount));
                 console.log("[GlobalRL] volume:", uint256(grlMid.globalVolumeInWindow));
@@ -745,7 +788,7 @@ contract StableGuardTest is Test {
         vm.resumeGasMetering();
 
         // Log state before final revert attempt
-        StableGuard.GlobalRateLimit memory grlAfter = stableGuard.getGlobalRateLimit();
+        RateLimiter.GlobalRateLimit memory grlAfter = stableGuard.getGlobalRateLimit();
         console.log("[GlobalRL] after 1000 ops ts:", block.timestamp);
         console.log("[GlobalRL] windowStart:", uint256(grlAfter.globalWindowStart));
         console.log("[GlobalRL] opCount:", uint256(grlAfter.globalOperationCount));
@@ -784,6 +827,31 @@ contract StableGuardTest is Test {
         assertEq(stableGuard.balanceOf(user), 50e18);
         // Strict forward: user should receive the 50 collateral tokens
         assertEq(mockToken.balanceOf(user), 50e18);
+    }
+
+    function test_BurnAndWithdraw_RevertWhileCollateralInAuction() public {
+        // Setup: deposit 200, mint 100
+        uint256 depositAmount = 200e18;
+        uint256 mintAmount = 100e18;
+        collateralManager.setTotalCollateralValue(user, 0);
+        mockToken.mint(user, depositAmount);
+        vm.startPrank(user);
+        mockToken.approve(address(stableGuard), depositAmount);
+        stableGuard.depositAndMint(address(mockToken), depositAmount, mintAmount);
+        vm.stopPrank();
+        collateralManager.setTotalCollateralValue(user, 200e18);
+
+        // An active auction on this token blocks withdrawals
+        auctionManager.setUserTokenAuction(user, address(mockToken), 7);
+
+        vm.prank(user);
+        vm.expectRevert("Collateral in auction");
+        stableGuard.burnAndWithdraw(address(mockToken), 50e18, 50e18);
+
+        // Once the auction clears, the withdrawal succeeds
+        auctionManager.setUserTokenAuction(user, address(mockToken), 0);
+        vm.prank(user);
+        stableGuard.burnAndWithdraw(address(mockToken), 50e18, 50e18);
     }
 
     function test_LiquidatePosition_ERC20_ForwardsToLiquidator_Success() public {
@@ -873,17 +941,28 @@ contract StableGuardTest is Test {
         stableGuard.depositAndMint(address(mockToken), depositAmount, mintAmount);
         vm.stopPrank();
 
-        // Give StableGuard contract tokens to burn
+        // Fund the CollateralManager so it can pay out the seized collateral
+        mockToken.mint(address(collateralManager), depositAmount);
+
+        // Owner sources 50 SGD and approves StableGuard to pull them
         vm.prank(user);
-        bool okTransfer2 = stableGuard.transfer(address(stableGuard), 50e18);
-        assertTrue(okTransfer2, "ERC20 transfer failed");
+        stableGuard.transfer(owner, 50e18);
 
-        // Owner calls emergencyLiquidate
-        vm.prank(owner);
-        stableGuard.emergencyLiquidate(user, 50e18);
+        uint256 supplyBefore = stableGuard.totalSupply();
+        uint256 ownerTokensBefore = mockToken.balanceOf(owner);
 
+        vm.startPrank(owner);
+        stableGuard.approve(address(stableGuard), 50e18);
+        stableGuard.emergencyLiquidate(user, address(mockToken), 50e18);
+        vm.stopPrank();
+
+        // Exactly one debt decrement, one burn, and equivalent collateral seized
         StableGuard.UserPosition memory pos = stableGuard.getUserPosition(user);
         assertEq(pos.debt, 50e18);
+        assertEq(stableGuard.totalSupply(), supplyBefore - 50e18);
+        // mockToken is priced at $1 with 18 decimals -> $50 = 50 tokens
+        assertEq(mockToken.balanceOf(owner), ownerTokensBefore + 50e18);
+        assertEq(collateralManager.getUserCollateral(user, address(mockToken)), depositAmount - 50e18);
     }
 
     function test_ProcessAuctionCompletion_UpdatesDebt() public {
@@ -950,20 +1029,20 @@ contract StableGuardTest is Test {
 
         // First small burn/withdraw succeeds
         console.log("[Cooldown] t0 (after initial warp):", block.timestamp);
-        StableGuard.RateLimitData memory before1 = stableGuard.getUserRateLimit(user);
+        RateLimiter.RateLimitData memory before1 = stableGuard.getUserRateLimit(user);
         console.log("[Cooldown] before1 lastOp:", uint256(before1.lastOperationTime));
         console.log("[Cooldown] before1 burst:", uint256(before1.burstCount));
         console.log("[Cooldown] before1 opCount:", uint256(before1.operationCount));
         vm.prank(user);
         stableGuard.burnAndWithdraw(address(mockToken), 1e18, 1e18);
-        StableGuard.RateLimitData memory after1 = stableGuard.getUserRateLimit(user);
+        RateLimiter.RateLimitData memory after1 = stableGuard.getUserRateLimit(user);
         console.log("[Cooldown] after1 lastOp:", uint256(after1.lastOperationTime));
         console.log("[Cooldown] after1 burst:", uint256(after1.burstCount));
         console.log("[Cooldown] after1 opCount:", uint256(after1.operationCount));
 
         // Immediate second operation should hit cooldown (5 minutes)
         console.log("[Cooldown] t1:", block.timestamp);
-        StableGuard.RateLimitData memory before2 = stableGuard.getUserRateLimit(user);
+        RateLimiter.RateLimitData memory before2 = stableGuard.getUserRateLimit(user);
         console.log("[Cooldown] before2 lastOp:", uint256(before2.lastOperationTime));
         console.log("[Cooldown] before2 burst:", uint256(before2.burstCount));
         console.log("[Cooldown] before2 opCount:", uint256(before2.operationCount));
@@ -974,13 +1053,13 @@ contract StableGuardTest is Test {
         // After cooldown period, operation succeeds (warp full cooldown)
         vm.warp(block.timestamp + 5 minutes + 1);
         console.log("[Cooldown] t2 (after warp):", block.timestamp);
-        StableGuard.RateLimitData memory before3 = stableGuard.getUserRateLimit(user);
+        RateLimiter.RateLimitData memory before3 = stableGuard.getUserRateLimit(user);
         console.log("[Cooldown] before3 lastOp:", uint256(before3.lastOperationTime));
         console.log("[Cooldown] before3 burst:", uint256(before3.burstCount));
         console.log("[Cooldown] before3 opCount:", uint256(before3.operationCount));
         vm.prank(user);
         stableGuard.burnAndWithdraw(address(mockToken), 1e18, 1e18);
-        StableGuard.RateLimitData memory after3 = stableGuard.getUserRateLimit(user);
+        RateLimiter.RateLimitData memory after3 = stableGuard.getUserRateLimit(user);
         console.log("[Cooldown] after3 lastOp:", uint256(after3.lastOperationTime));
         console.log("[Cooldown] after3 burst:", uint256(after3.burstCount));
         console.log("[Cooldown] after3 opCount:", uint256(after3.operationCount));
@@ -1023,7 +1102,7 @@ contract StableGuardTest is Test {
         for (uint256 i = 0; i < 10; i++) {
             vm.prank(user);
             stableGuard.burnAndWithdraw(address(mockToken), 1e18, 1e18);
-            StableGuard.RateLimitData memory rl = stableGuard.getUserRateLimit(user);
+            RateLimiter.RateLimitData memory rl = stableGuard.getUserRateLimit(user);
             console.log("[UserRL-MAXOPS] op", i + 1, "ts:", block.timestamp);
             console.log("[UserRL-MAXOPS] opCount:", uint256(rl.operationCount));
             console.log("[UserRL-MAXOPS] burstCount:", uint256(rl.burstCount));
@@ -1033,7 +1112,7 @@ contract StableGuardTest is Test {
         }
 
         // 11th operation within the same hour should exceed MAX_OPERATIONS_PER_HOUR
-        StableGuard.RateLimitData memory rlBefore11 = stableGuard.getUserRateLimit(user);
+        RateLimiter.RateLimitData memory rlBefore11 = stableGuard.getUserRateLimit(user);
         console.log("[UserRL-MAXOPS] before 11th op ts:", block.timestamp);
         console.log("[UserRL-MAXOPS] opCount:", uint256(rlBefore11.operationCount));
         console.log("[UserRL-MAXOPS] burstCount:", uint256(rlBefore11.burstCount));
@@ -1061,9 +1140,8 @@ contract StableGuardTest is Test {
         assertEq(stableGuard.balanceOf(user), mintAmount);
     }
 
-    // New StableGuard-only tests for repeg admin wrappers and module update success
-    function test_Repeg_Admin_UpdateConfig_OnlyOwner_AndEffect() public {
-        // Non-owner cannot update config
+    // Repeg config changes are governance actions, routed through the Timelock
+    function test_Repeg_Admin_UpdateConfig_OnlyTimelock_AndEffect() public {
         IRepegManager.RepegConfig memory newCfg = IRepegManager.RepegConfig({
             targetPrice: 1e18,
             deviationThreshold: 777,
@@ -1074,15 +1152,19 @@ contract StableGuardTest is Test {
             enabled: true
         });
 
-        vm.expectRevert("Only owner");
-        vm.prank(address(0x444));
-        stableGuard.updateRepegConfig(newCfg);
-
-        // Owner updates config
+        // Even the owner cannot call it directly — it must come from the Timelock
+        vm.expectRevert("Only timelock");
         vm.prank(owner);
         stableGuard.updateRepegConfig(newCfg);
 
-        // Verify config changed via wrapper getter
+        vm.expectRevert("Only timelock");
+        vm.prank(address(0x444));
+        stableGuard.updateRepegConfig(newCfg);
+
+        // The Timelock updates config
+        vm.prank(timelock);
+        stableGuard.updateRepegConfig(newCfg);
+
         IRepegManager.RepegConfig memory readCfg = stableGuard.getRepegConfig();
         assertEq(readCfg.deviationThreshold, 777);
         assertEq(readCfg.incentiveRate, 555);
@@ -1098,16 +1180,16 @@ contract StableGuardTest is Test {
         vm.prank(owner);
         stableGuard.setRepegEmergencyPause(true);
 
-        // Liquidity provision should revert due to pause in mock
+        // Liquidity provision (now direct on the RepegManager) reverts while paused
         vm.expectRevert("paused");
-        stableGuard.provideRepegLiquidity{value: 0}(1000);
+        repegManager.provideLiquidity(1000);
 
         // Owner unpauses operations
         vm.prank(owner);
         stableGuard.setRepegEmergencyPause(false);
 
         // Liquidity provision should succeed
-        bool ok = stableGuard.provideRepegLiquidity{value: 0}(500);
+        bool ok = repegManager.provideLiquidity(500);
         assertTrue(ok);
     }
 
@@ -1131,8 +1213,8 @@ contract StableGuardTest is Test {
         });
         repegManager2.updateRepegConfig(cfg2);
 
-        // Update modules (owner only)
-        vm.prank(owner);
+        // Update modules (via Timelock)
+        vm.prank(timelock);
         stableGuard.updateModules(
             address(priceOracle2),
             address(collateralManager2),
@@ -1167,12 +1249,14 @@ contract StableGuardTest is Test {
     }
 
     function test_Repeg_LiquidityProvideWithdraw() public {
-        bool ok = stableGuard.provideRepegLiquidity{value: 0}(1000);
+        // Liquidity flows directly through the RepegManager so the provider is
+        // credited correctly; StableGuard only exposes the read-side status.
+        bool ok = repegManager.provideLiquidity(1000);
         assertTrue(ok);
         (uint256 tl, uint256 al) = stableGuard.getRepegLiquidityStatus();
         assertEq(tl, 1000);
         assertEq(al, 1000);
-        ok = stableGuard.withdrawRepegLiquidity(400);
+        ok = repegManager.withdrawLiquidity(400);
         assertTrue(ok);
         (tl, al) = stableGuard.getRepegLiquidityStatus();
         assertEq(tl, 600);
@@ -1221,7 +1305,7 @@ contract StableGuardTest is Test {
         stableGuard.burnAndWithdraw(address(mockToken), 1e18, 1e18);
 
         // Verify counters updated
-        StableGuard.RateLimitData memory beforeData = stableGuard.getUserRateLimit(user);
+        RateLimiter.RateLimitData memory beforeData = stableGuard.getUserRateLimit(user);
         assertGt(beforeData.operationCount, 0);
         assertGt(beforeData.volumeInWindow, 0);
 
@@ -1229,7 +1313,7 @@ contract StableGuardTest is Test {
         vm.prank(owner);
         stableGuard.resetUserRateLimit(user);
 
-        StableGuard.RateLimitData memory afterData = stableGuard.getUserRateLimit(user);
+        RateLimiter.RateLimitData memory afterData = stableGuard.getUserRateLimit(user);
         assertEq(afterData.operationCount, 0);
         assertEq(afterData.volumeInWindow, 0);
         assertEq(afterData.lastOperationTime, 0);
@@ -1372,14 +1456,25 @@ contract StableGuardTest is Test {
     function test_UpdateModules_DuplicateAddresses_Revert() public {
         // priceOracle == collateralManager to trigger duplicate address revert
         vm.expectRevert("Duplicate module addresses");
-        vm.prank(owner);
+        vm.prank(timelock);
         stableGuard.updateModules(
             address(priceOracle), address(priceOracle), address(liquidationManager), address(auctionManager), repeg
         );
     }
 
-    function test_UpdateModules_OnlyOwner_RevertForNonOwner() public {
-        vm.expectRevert("Only owner");
+    function test_UpdateModules_OnlyTimelock_RevertOtherwise() public {
+        // The owner cannot bypass the Timelock
+        vm.expectRevert("Only timelock");
+        vm.prank(owner);
+        stableGuard.updateModules(
+            address(priceOracle),
+            address(collateralManager),
+            address(liquidationManager),
+            address(auctionManager),
+            repeg
+        );
+
+        vm.expectRevert("Only timelock");
         vm.prank(address(0x444));
         stableGuard.updateModules(
             address(priceOracle),
@@ -1412,5 +1507,70 @@ contract StableGuardTest is Test {
         vm.warp(block.timestamp + 5 minutes);
         allowed = stableGuard.checkRateLimitStatus(user, "WITHDRAW", 1e18);
         assertEq(allowed, true);
+    }
+}
+
+// =====================
+// Governance via Timelock (end-to-end with the real Timelock)
+// =====================
+
+contract StableGuardTimelockTest is Test {
+    StableGuard public stableGuard;
+    Timelock public timelock;
+    MockPriceOracle public priceOracle;
+    MockCollateralManager public collateralManager;
+    MockLiquidationManager public liquidationManager;
+    MockDutchAuctionManager public auctionManager;
+    MockRepegManager public repegManager;
+
+    address public deployer = address(this); // owner of the Timelock
+
+    function setUp() public {
+        vm.warp(1_000_000);
+
+        priceOracle = new MockPriceOracle();
+        collateralManager = new MockCollateralManager();
+        liquidationManager = new MockLiquidationManager();
+        auctionManager = new MockDutchAuctionManager();
+        repegManager = new MockRepegManager();
+
+        // Deployer owns the Timelock; StableGuard is wired to it
+        timelock = new Timelock(2 days);
+        stableGuard = new StableGuard(
+            address(priceOracle),
+            address(collateralManager),
+            address(liquidationManager),
+            address(auctionManager),
+            address(repegManager),
+            address(timelock)
+        );
+    }
+
+    function test_UpdateConfig_ExecutesThroughTimelockAfterDelay() public {
+        // Queue updateConfig(16000, 13000, 11000) on StableGuard
+        bytes memory data = abi.encode(uint64(16000), uint64(13000), uint32(11000));
+        string memory sig = "updateConfig(uint64,uint64,uint32)";
+        uint256 eta = block.timestamp + timelock.MINIMUM_DELAY();
+
+        timelock.queueTransaction(address(stableGuard), 0, sig, data, eta);
+
+        // Executing before the delay must revert
+        vm.expectRevert(Timelock.TransactionNotReady.selector);
+        timelock.executeTransaction(address(stableGuard), 0, sig, data, eta);
+
+        // After the delay, it executes and the config actually changes
+        vm.warp(eta);
+        timelock.executeTransaction(address(stableGuard), 0, sig, data, eta);
+
+        StableGuard.PackedConfig memory cfg = stableGuard.getSystemConfig();
+        assertEq(cfg.minCollateralRatio, 16000);
+        assertEq(cfg.liquidationThreshold, 13000);
+        assertEq(cfg.emergencyThreshold, 11000);
+    }
+
+    function test_UpdateConfig_DirectByOwnerReverts() public {
+        // The StableGuard OWNER (deployer) cannot call updateConfig directly
+        vm.expectRevert("Only timelock");
+        stableGuard.updateConfig(16000, 13000, 11000);
     }
 }

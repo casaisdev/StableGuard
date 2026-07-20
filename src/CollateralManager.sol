@@ -3,6 +3,7 @@ pragma solidity ^0.8.19;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {ICollateralManager} from "./interfaces/ICollateralManager.sol";
 import {IPriceOracle} from "./interfaces/IPriceOracle.sol";
 import {Constants} from "./Constants.sol";
@@ -11,7 +12,7 @@ import {Constants} from "./Constants.sol";
  * @title CollateralManager - Gas Optimized & Security Hardened
  * @dev Optimized for gas efficiency while maintaining full functionality and security
  */
-contract CollateralManager is ICollateralManager, ReentrancyGuard {
+contract CollateralManager is ICollateralManager, ReentrancyGuard, Ownable {
     // ============ STRUCTS ============
 
     struct UserCollateral {
@@ -24,21 +25,21 @@ contract CollateralManager is ICollateralManager, ReentrancyGuard {
         address priceFeed;
         uint256 fallbackPrice;
         uint8 decimals;
-        uint16 ltv; // Loan-to-Value ratio (basis points, e.g., 8000 = 80%)
-        uint16 liquidationThreshold; // Liquidation threshold (basis points, e.g., 12000 = 120%)
-        uint16 liquidationPenalty; // Liquidation penalty (basis points, e.g., 800 = 8%)
         bool isActive;
+        // Risk parameters (ratios, thresholds, bonus) live in StableGuard's
+        // config — the single source of truth — not per collateral type.
     }
 
     // ============ CONSTANTS ============
     uint256 private constant MAX_UINT128 = type(uint128).max;
 
     // ============ IMMUTABLES ============
-    address public immutable OWNER;
     IPriceOracle public immutable PRICE_ORACLE;
 
     // ============ STATE VARIABLES ============
     address public stableGuard;
+    /// @dev Contracts allowed to move custody (StableGuard, DutchAuctionManager)
+    mapping(address => bool) public authorizedManagers;
     mapping(address => mapping(address => UserCollateral)) public collateral;
     mapping(address => address[]) public userTokens;
     mapping(address => CollateralType) public collateralTypes;
@@ -46,17 +47,17 @@ contract CollateralManager is ICollateralManager, ReentrancyGuard {
 
     // ============ MODIFIERS ============
     modifier onlyAuth() {
-        if (msg.sender != OWNER && msg.sender != stableGuard) revert Unauthorized();
-        _;
-    }
-
-    modifier onlyOwner() {
-        if (msg.sender != OWNER) revert Unauthorized();
+        if (msg.sender != owner() && msg.sender != stableGuard) revert Unauthorized();
         _;
     }
 
     modifier onlyStableGuard() {
         if (msg.sender != stableGuard) revert Unauthorized();
+        _;
+    }
+
+    modifier onlyAuthorizedManager() {
+        if (!authorizedManagers[msg.sender]) revert Unauthorized();
         _;
     }
 
@@ -71,49 +72,42 @@ contract CollateralManager is ICollateralManager, ReentrancyGuard {
     }
 
     // ============ CONSTRUCTOR ============
-    constructor(address _priceOracle) {
+    constructor(address _priceOracle) Ownable(msg.sender) {
         if (_priceOracle == address(0)) revert InvalidAddress();
-        OWNER = msg.sender;
         PRICE_ORACLE = IPriceOracle(_priceOracle);
     }
 
     // ============ EXTERNAL FUNCTIONS ============
     function setStableGuard(address _stableGuard) external onlyAuth {
         if (_stableGuard == address(0)) revert InvalidAddress();
+        // StableGuard must always be able to move custody
+        if (stableGuard != address(0)) authorizedManagers[stableGuard] = false;
         stableGuard = _stableGuard;
+        authorizedManagers[_stableGuard] = true;
     }
 
-    function addCollateralType(
-        address token,
-        address priceFeed,
-        uint256 fallbackPrice,
-        uint8 decimals,
-        uint16 ltv,
-        uint16 liquidationThreshold,
-        uint16 liquidationPenalty
-    ) external override onlyAuth {
+    function setAuthorizedManager(address manager, bool authorized) external onlyOwner {
+        if (manager == address(0)) revert InvalidAddress();
+        authorizedManagers[manager] = authorized;
+        emit AuthorizedManagerSet(manager, authorized);
+    }
+
+    function addCollateralType(address token, address priceFeed, uint256 fallbackPrice, uint8 decimals)
+        external
+        override
+        onlyAuth
+    {
         // CHECKS: Input validation
         if (token == address(0)) revert InvalidAddress();
         if (priceFeed == address(0)) revert InvalidAddress();
         if (fallbackPrice == 0) revert InvalidAmount();
-        if (ltv == 0 || ltv > 10000) revert InvalidAmount(); // Max 100%
-        if (liquidationThreshold == 0 || liquidationThreshold > 15000) revert InvalidAmount(); // Max 150%
-        if (liquidationThreshold <= ltv) revert InvalidAmount(); // Liquidation threshold must be higher than LTV
-        if (liquidationPenalty == 0 || liquidationPenalty > 2000) revert InvalidAmount(); // Max 20%
 
         // Check if token is already supported
         if (collateralTypes[token].isActive) revert InvalidAddress(); // Reusing error for "already exists"
 
         // EFFECTS: Add collateral type
         collateralTypes[token] = CollateralType({
-            token: token,
-            priceFeed: priceFeed,
-            fallbackPrice: fallbackPrice,
-            decimals: decimals,
-            ltv: ltv,
-            liquidationThreshold: liquidationThreshold,
-            liquidationPenalty: liquidationPenalty,
-            isActive: true
+            token: token, priceFeed: priceFeed, fallbackPrice: fallbackPrice, decimals: decimals, isActive: true
         });
 
         supportedTokens.push(token);
@@ -150,15 +144,16 @@ contract CollateralManager is ICollateralManager, ReentrancyGuard {
         emit Deposit(user, token, amount);
     }
 
-    function withdraw(address user, address token, uint256 amount)
+    function withdraw(address user, address token, uint256 amount, address recipient)
         external
         override
-        onlyStableGuard
+        onlyAuthorizedManager
         validUser(user)
         validAmount(amount)
         nonReentrant
     {
         // CHECKS: Input validation
+        if (recipient == address(0)) revert InvalidAddress();
         UserCollateral storage userCol = collateral[user][token];
         if (userCol.amount < amount) revert InsufficientCollateral();
 
@@ -167,10 +162,10 @@ contract CollateralManager is ICollateralManager, ReentrancyGuard {
 
         // INTERACTIONS: External transfers at the end
         if (token == Constants.ETH_TOKEN) {
-            (bool success,) = msg.sender.call{value: amount}("");
+            (bool success,) = recipient.call{value: amount}("");
             if (!success) revert TransferFailed();
         } else {
-            bool success = IERC20(token).transfer(msg.sender, amount);
+            bool success = IERC20(token).transfer(recipient, amount);
             if (!success) revert TransferFailed();
         }
 
@@ -199,11 +194,8 @@ contract CollateralManager is ICollateralManager, ReentrancyGuard {
             UserCollateral memory userCol = collateral[user][token]; // Cache entire struct
 
             if (userCol.amount > 0) {
-                try PRICE_ORACLE.getTokenPrice(token) returns (uint256 price) {
-                    // Additional validation: price must be > 0
-                    if (price > 0) {
-                        totalValue += (price * userCol.amount) / 1e18;
-                    }
+                try PRICE_ORACLE.getTokenValueInUsd(token, userCol.amount) returns (uint256 value) {
+                    totalValue += value;
                 } catch {
                     // Skip tokens with failed price calls
                 }
@@ -283,10 +275,10 @@ contract CollateralManager is ICollateralManager, ReentrancyGuard {
 
         // INTERACTIONS: External transfers
         if (token == Constants.ETH_TOKEN) {
-            (bool success,) = OWNER.call{value: amount}("");
+            (bool success,) = owner().call{value: amount}("");
             if (!success) revert TransferFailed();
         } else {
-            bool success = IERC20(token).transfer(OWNER, amount);
+            bool success = IERC20(token).transfer(owner(), amount);
             if (!success) revert TransferFailed();
         }
     }

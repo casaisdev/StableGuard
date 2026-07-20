@@ -5,37 +5,14 @@ pragma solidity ^0.8.19;
  * @title ILiquidationManager - Ultra-Optimized Interface
  * @dev Minimal gas-optimized interface for liquidation management
  */
+/// @dev Risk & calculation module: liquidations are executed by StableGuard and
+///      DutchAuctionManager; this module only assesses and converts.
 interface ILiquidationManager {
-    // ============ EVENTS ============
-
-    /// @dev Event emitted when a liquidation occurs
-    event LiquidationEvent(
-        address indexed liquidator,
-        address indexed user,
-        address indexed token,
-        uint256 debtAmount,
-        uint256 liquidationAmount
-    );
-
     // ============ ERRORS ============
     error Unauthorized();
     error InvalidAmount();
     error InvalidAddress();
     error NoCollateral();
-
-    // ============ CORE FUNCTIONS ============
-
-    /// @dev Liquidate user position with optimal token selection
-    function liquidate(address user, uint256 debtAmount) external returns (bool);
-
-    /// @dev Liquidate user position with specific token
-    function liquidate(address user, address token, uint256 debtAmount) external returns (bool);
-
-    /// @dev Direct liquidation (owner only)
-    function liquidateDirect(address user, uint256 debtAmount) external returns (bool);
-
-    /// @dev Direct liquidation with specific token (owner only)
-    function liquidateDirect(address user, address token, uint256 debtAmount) external returns (bool);
 
     // ============ VIEW FUNCTIONS ============
 
@@ -62,6 +39,6 @@ interface ILiquidationManager {
     /// @dev Find optimal token for liquidation (alternative signature)
     function findOptimalTokenForLiquidation(address user) external returns (address);
 
-    /// @dev Get liquidation constants
-    function getLiquidationConstants() external pure returns (uint256, uint256, uint256);
+    /// @dev Get liquidation thresholds (read from StableGuard's config)
+    function getLiquidationConstants() external view returns (uint256, uint256, uint256);
 }

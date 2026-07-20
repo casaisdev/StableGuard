@@ -7,6 +7,7 @@ import {ICollateralManager} from "../src/interfaces/ICollateralManager.sol";
 import {IPriceOracle} from "../src/interfaces/IPriceOracle.sol";
 import {Constants} from "../src/Constants.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
 // ============ MOCK CONTRACTS ============
 
@@ -45,6 +46,10 @@ contract MockPriceOracle is IPriceOracle {
 
     function setSupportedToken(address token, bool supported) external {
         supportedTokens[token] = supported;
+    }
+
+    function setTokenDecimals(address token, uint8 decimals) external {
+        tokenDecimals[token] = decimals;
     }
 
     // Core functions
@@ -124,6 +129,11 @@ contract MockPriceOracle is IPriceOracle {
         return (amount * price) / (10 ** decimals);
     }
 
+    function getTokenAmountFromUsd(address token, uint256 usdValue) external view returns (uint256) {
+        require(supportedTokens[token], "Token not supported");
+        return (usdValue * (10 ** tokenDecimals[token])) / prices[token];
+    }
+
     function getTokenConfig(address token)
         external
         view
@@ -183,7 +193,7 @@ contract MockStableGuard {
     }
 
     function withdrawCollateral(address user, address token, uint256 amount) external {
-        collateralManager.withdraw(user, token, amount);
+        collateralManager.withdraw(user, token, amount, address(this));
     }
 
     function startReentrancyAttack(address user, address token, uint256 amount) external {
@@ -193,14 +203,14 @@ contract MockStableGuard {
         attackAmount = amount;
 
         // Start the attack
-        collateralManager.withdraw(user, token, amount);
+        collateralManager.withdraw(user, token, amount, address(this));
     }
 
     receive() external payable {
         if (attacking) {
             attacking = false; // Prevent infinite recursion
             // Try to reenter
-            collateralManager.withdraw(attackUser, attackToken, attackAmount);
+            collateralManager.withdraw(attackUser, attackToken, attackAmount, address(this));
         }
     }
 }
@@ -223,14 +233,14 @@ contract ReentrancyAttacker {
         attacking = true;
 
         // Try to withdraw (this should trigger reentrancy)
-        target.withdraw(address(this), token, amount);
+        target.withdraw(address(this), token, amount, address(this));
     }
 
     // This will be called when ETH is sent to this contract
     receive() external payable {
         if (attacking && address(target).balance >= amount) {
             // Try to reenter
-            target.withdraw(address(this), token, amount);
+            target.withdraw(address(this), token, amount, address(this));
         }
     }
 }
@@ -284,6 +294,10 @@ contract CollateralManagerTest is Test {
         priceOracle.setPrice(address(usdc), USDC_PRICE);
         priceOracle.setPrice(address(wbtc), WBTC_PRICE);
 
+        priceOracle.setTokenDecimals(Constants.ETH_TOKEN, 18);
+        priceOracle.setTokenDecimals(address(usdc), 6);
+        priceOracle.setTokenDecimals(address(wbtc), 8);
+
         priceOracle.setSupportedToken(Constants.ETH_TOKEN, true);
         priceOracle.setSupportedToken(address(usdc), true);
         priceOracle.setSupportedToken(address(wbtc), true);
@@ -332,7 +346,7 @@ contract CollateralManagerTest is Test {
     function test_Constructor_Success() public {
         CollateralManager newManager = new CollateralManager(address(priceOracle));
 
-        assertEq(newManager.OWNER(), address(this));
+        assertEq(newManager.owner(), address(this));
         assertEq(address(newManager.PRICE_ORACLE()), address(priceOracle));
         assertEq(newManager.stableGuard(), address(0));
     }
@@ -372,60 +386,38 @@ contract CollateralManagerTest is Test {
             newToken,
             priceFeed,
             1000e18, // fallbackPrice
-            18, // decimals
-            8000, // ltv (80%)
-            12000, // liquidationThreshold (120%)
-            800 // liquidationPenalty (8%)
+            18 // decimals
         );
 
-        (
-            address token,
-            address feed,
-            uint256 fallbackPrice,
-            uint8 decimals,
-            uint16 ltv,
-            uint16 liquidationThreshold,
-            uint16 liquidationPenalty,
-            bool isActive
-        ) = collateralManager.collateralTypes(newToken);
+        (address token, address feed, uint256 fallbackPrice, uint8 decimals, bool isActive) =
+            collateralManager.collateralTypes(newToken);
 
         assertEq(token, newToken);
         assertEq(feed, priceFeed);
         assertEq(fallbackPrice, 1000e18);
         assertEq(decimals, 18);
-        assertEq(ltv, 8000);
-        assertEq(liquidationThreshold, 12000);
-        assertEq(liquidationPenalty, 800);
         assertTrue(isActive);
     }
 
     function test_AddCollateralType_RevertInvalidToken() public {
         vm.expectRevert(ICollateralManager.InvalidAddress.selector);
-        collateralManager.addCollateralType(address(0), makeAddr("priceFeed"), 1000e18, 18, 8000, 12000, 800);
+        collateralManager.addCollateralType(address(0), makeAddr("priceFeed"), 1000e18, 18);
     }
 
     function test_AddCollateralType_RevertInvalidPriceFeed() public {
         vm.expectRevert(ICollateralManager.InvalidAddress.selector);
-        collateralManager.addCollateralType(makeAddr("token"), address(0), 1000e18, 18, 8000, 12000, 800);
+        collateralManager.addCollateralType(makeAddr("token"), address(0), 1000e18, 18);
     }
 
-    function test_AddCollateralType_RevertInvalidLTV() public {
+    function test_AddCollateralType_RevertZeroFallbackPrice() public {
         vm.expectRevert(ICollateralManager.InvalidAmount.selector);
-        collateralManager.addCollateralType(makeAddr("token"), makeAddr("priceFeed"), 1000e18, 18, 0, 12000, 800);
-
-        vm.expectRevert(ICollateralManager.InvalidAmount.selector);
-        collateralManager.addCollateralType(makeAddr("token"), makeAddr("priceFeed"), 1000e18, 18, 10001, 12000, 800);
-    }
-
-    function test_AddCollateralType_RevertInvalidLiquidationThreshold() public {
-        vm.expectRevert(ICollateralManager.InvalidAmount.selector);
-        collateralManager.addCollateralType(makeAddr("token"), makeAddr("priceFeed"), 1000e18, 18, 8000, 7999, 800);
+        collateralManager.addCollateralType(makeAddr("token"), makeAddr("priceFeed"), 0, 18);
     }
 
     function test_AddCollateralType_RevertUnauthorized() public {
         vm.prank(unauthorized);
         vm.expectRevert(ICollateralManager.Unauthorized.selector);
-        collateralManager.addCollateralType(makeAddr("token"), makeAddr("priceFeed"), 1000e18, 18, 8000, 12000, 800);
+        collateralManager.addCollateralType(makeAddr("token"), makeAddr("priceFeed"), 1000e18, 18);
     }
 
     // ============ DEPOSIT TESTS ============
@@ -509,7 +501,7 @@ contract CollateralManagerTest is Test {
         emit Withdraw(user1, Constants.ETH_TOKEN, DEPOSIT_AMOUNT_ETH);
 
         vm.prank(address(stableGuard));
-        collateralManager.withdraw(user1, Constants.ETH_TOKEN, DEPOSIT_AMOUNT_ETH);
+        collateralManager.withdraw(user1, Constants.ETH_TOKEN, DEPOSIT_AMOUNT_ETH, address(stableGuard));
 
         assertEq(collateralManager.getUserCollateral(user1, Constants.ETH_TOKEN), 0);
         assertEq(address(stableGuard).balance, balanceBefore + DEPOSIT_AMOUNT_ETH);
@@ -529,7 +521,7 @@ contract CollateralManagerTest is Test {
         emit Withdraw(user1, address(usdc), DEPOSIT_AMOUNT_USDC);
 
         vm.prank(address(stableGuard));
-        collateralManager.withdraw(user1, address(usdc), DEPOSIT_AMOUNT_USDC);
+        collateralManager.withdraw(user1, address(usdc), DEPOSIT_AMOUNT_USDC, address(stableGuard));
 
         assertEq(collateralManager.getUserCollateral(user1, address(usdc)), 0);
         assertEq(usdc.balanceOf(address(stableGuard)), balanceBefore + DEPOSIT_AMOUNT_USDC);
@@ -541,13 +533,13 @@ contract CollateralManagerTest is Test {
     function test_Withdraw_RevertInsufficientCollateral() public {
         vm.prank(address(stableGuard));
         vm.expectRevert(ICollateralManager.InsufficientCollateral.selector);
-        collateralManager.withdraw(user1, Constants.ETH_TOKEN, DEPOSIT_AMOUNT_ETH);
+        collateralManager.withdraw(user1, Constants.ETH_TOKEN, DEPOSIT_AMOUNT_ETH, address(stableGuard));
     }
 
     function test_Withdraw_RevertUnauthorized() public {
         vm.prank(unauthorized);
         vm.expectRevert(ICollateralManager.Unauthorized.selector);
-        collateralManager.withdraw(user1, Constants.ETH_TOKEN, DEPOSIT_AMOUNT_ETH);
+        collateralManager.withdraw(user1, Constants.ETH_TOKEN, DEPOSIT_AMOUNT_ETH, address(stableGuard));
     }
 
     // ============ VIEW FUNCTIONS TESTS ============
@@ -562,10 +554,11 @@ contract CollateralManagerTest is Test {
 
         uint256 totalValue = collateralManager.getTotalCollateralValue(user1);
 
-        // Expected: 1 ETH * $2000 + 1000 USDC * $1 = $3000
-        uint256 expectedValue = (DEPOSIT_AMOUNT_ETH * ETH_PRICE) / 1e18 + (DEPOSIT_AMOUNT_USDC * USDC_PRICE) / 1e18;
+        // Expected: 1 ETH * $2000 + 1000 USDC (6 decimals) * $1 = $3000
+        uint256 expectedValue = (DEPOSIT_AMOUNT_ETH * ETH_PRICE) / 1e18 + (DEPOSIT_AMOUNT_USDC * USDC_PRICE) / 1e6;
 
         assertEq(totalValue, expectedValue);
+        assertEq(totalValue, 3000e18);
     }
 
     function test_GetTotalCollateralValue_EmptyUser() public {
@@ -615,6 +608,52 @@ contract CollateralManagerTest is Test {
         collateralManager.canLiquidate(user1, 1000e18, 15001);
     }
 
+    // ============ AUTHORIZED MANAGER TESTS ============
+
+    function test_SetAuthorizedManager_Success() public {
+        address manager = makeAddr("manager");
+        collateralManager.setAuthorizedManager(manager, true);
+        assertTrue(collateralManager.authorizedManagers(manager));
+
+        collateralManager.setAuthorizedManager(manager, false);
+        assertFalse(collateralManager.authorizedManagers(manager));
+    }
+
+    function test_SetAuthorizedManager_RevertNonOwner() public {
+        vm.prank(unauthorized);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, unauthorized));
+        collateralManager.setAuthorizedManager(unauthorized, true);
+    }
+
+    function test_SetStableGuard_AutoAuthorizes() public {
+        // setUp wired the mock StableGuard; it must be able to move custody
+        assertTrue(collateralManager.authorizedManagers(address(stableGuard)));
+    }
+
+    function test_Withdraw_PaysRecipientDirectly() public {
+        vm.prank(address(stableGuard));
+        collateralManager.deposit{value: DEPOSIT_AMOUNT_ETH}(user1, Constants.ETH_TOKEN, DEPOSIT_AMOUNT_ETH);
+
+        address manager = makeAddr("auctionManager");
+        collateralManager.setAuthorizedManager(manager, true);
+
+        uint256 balBefore = user2.balance;
+        vm.prank(manager);
+        collateralManager.withdraw(user1, Constants.ETH_TOKEN, DEPOSIT_AMOUNT_ETH, user2);
+
+        assertEq(user2.balance, balBefore + DEPOSIT_AMOUNT_ETH);
+        assertEq(collateralManager.getUserCollateral(user1, Constants.ETH_TOKEN), 0);
+    }
+
+    function test_Withdraw_RevertUnauthorizedManager() public {
+        vm.prank(address(stableGuard));
+        collateralManager.deposit{value: DEPOSIT_AMOUNT_ETH}(user1, Constants.ETH_TOKEN, DEPOSIT_AMOUNT_ETH);
+
+        vm.prank(unauthorized);
+        vm.expectRevert(ICollateralManager.Unauthorized.selector);
+        collateralManager.withdraw(user1, Constants.ETH_TOKEN, DEPOSIT_AMOUNT_ETH, unauthorized);
+    }
+
     // ============ EMERGENCY FUNCTIONS TESTS ============
 
     function test_EmergencyWithdrawETH_Success() public {
@@ -645,7 +684,7 @@ contract CollateralManagerTest is Test {
 
     function test_EmergencyWithdraw_RevertUnauthorized() public {
         vm.prank(unauthorized);
-        vm.expectRevert(ICollateralManager.Unauthorized.selector);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, unauthorized));
         collateralManager.emergencyWithdraw(Constants.ETH_TOKEN, 1 ether);
     }
 
@@ -701,20 +740,21 @@ contract CollateralManagerTest is Test {
         address[] memory userTokens = collateralManager.getUserTokens(user1);
         assertEq(userTokens.length, 3);
 
-        // Check total value
+        // Check total value: 1 ETH ($2000) + 1000 USDC (6 dec, $1000) + 1 WBTC (8 dec, $30000)
         uint256 totalValue = collateralManager.getTotalCollateralValue(user1);
-        uint256 expectedValue = (1 ether * ETH_PRICE) / 1e18 + (1000e6 * USDC_PRICE) / 1e18 + (1e8 * WBTC_PRICE) / 1e18;
+        uint256 expectedValue = (1 ether * ETH_PRICE) / 1e18 + (1000e6 * USDC_PRICE) / 1e6 + (1e8 * WBTC_PRICE) / 1e8;
         assertEq(totalValue, expectedValue);
+        assertEq(totalValue, 33000e18);
 
         // Partial withdrawal
         vm.prank(address(stableGuard));
-        collateralManager.withdraw(user1, address(usdc), 500e6);
+        collateralManager.withdraw(user1, address(usdc), 500e6, address(stableGuard));
 
         assertEq(collateralManager.getUserCollateral(user1, address(usdc)), 500e6);
 
         // Complete withdrawal of one token
         vm.prank(address(stableGuard));
-        collateralManager.withdraw(user1, address(usdc), 500e6);
+        collateralManager.withdraw(user1, address(usdc), 500e6, address(stableGuard));
 
         userTokens = collateralManager.getUserTokens(user1);
         assertEq(userTokens.length, 2);
@@ -738,7 +778,7 @@ contract CollateralManagerTest is Test {
 
         // Withdraw
         vm.prank(address(stableGuard));
-        collateralManager.withdraw(user1, Constants.ETH_TOKEN, amount);
+        collateralManager.withdraw(user1, Constants.ETH_TOKEN, amount, address(stableGuard));
 
         assertEq(collateralManager.getUserCollateral(user1, Constants.ETH_TOKEN), 0);
     }

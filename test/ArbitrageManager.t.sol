@@ -782,10 +782,7 @@ contract MockPriceOracle is IPriceOracle {
         return price;
     }
 
-    function configureToken(address token, address priceFeed, uint256 fallbackPrice, uint8 decimals)
-        external
-        override
-    {
+    function configureToken(address token, address priceFeed, uint256 fallbackPrice, uint8 decimals) external override {
         priceFeeds[token] = priceFeed;
         fallbackPrices[token] = fallbackPrice;
         tokenDecimals[token] = decimals;
@@ -846,6 +843,12 @@ contract MockPriceOracle is IPriceOracle {
         uint8 decimals = tokenDecimals[token];
         if (decimals == 0) decimals = 18; // Default to 18 decimals
         return (amount * price) / (10 ** decimals);
+    }
+
+    function getTokenAmountFromUsd(address token, uint256 usdValue) external view override returns (uint256) {
+        uint8 decimals = tokenDecimals[token];
+        if (decimals == 0) decimals = 18; // Default to 18 decimals
+        return (usdValue * (10 ** decimals)) / prices[token];
     }
 
     function getTokenConfig(address token)
@@ -913,11 +916,7 @@ contract MockUniswapRouter {
         shouldFail = _shouldFail;
     }
 
-    function getAmountsOut(uint256 amountIn, address[] calldata path)
-        external
-        view
-        returns (uint256[] memory amounts)
-    {
+    function getAmountsOut(uint256 amountIn, address[] calldata path) external view returns (uint256[] memory amounts) {
         if (shouldFail) revert("Router failure");
 
         amounts = new uint256[](path.length);
@@ -1418,8 +1417,9 @@ contract ArbitrageManagerExtendedTest is Test {
 
         // This should fail due to reentrancy protection if implemented
         try attacker.attack() {
-            // If no reentrancy protection, this might succeed
-        } catch {
+        // If no reentrancy protection, this might succeed
+        }
+            catch {
             // Expected if reentrancy protection exists
         }
     }
@@ -1480,8 +1480,9 @@ contract ArbitrageManagerExtendedTest is Test {
         // But if there's a global limit, USER2 might be blocked
         vm.prank(USER2);
         try arbitrageManager.executeArbitrage() {
-            // Success - no global limit or global limit not reached
-        } catch {
+        // Success - no global limit or global limit not reached
+        }
+            catch {
             // Failed - global limit exists and was reached
         }
     }
@@ -1511,8 +1512,9 @@ contract ArbitrageManagerExtendedTest is Test {
 
         // Should either succeed with high profit or fail due to slippage protection
         try arbitrageManager.executeArbitrage() {
-            // Success - arbitrage executed with high profit
-        } catch {
+        // Success - arbitrage executed with high profit
+        }
+            catch {
             // Failed - slippage protection or other safety mechanism triggered
         }
     }
@@ -1528,8 +1530,9 @@ contract ArbitrageManagerExtendedTest is Test {
 
         // Should fail if staleness check is implemented
         try arbitrageManager.executeArbitrage() {
-            // Success - no staleness check or price is still valid
-        } catch {
+        // Success - no staleness check or price is still valid
+        }
+            catch {
             // Failed - staleness check triggered
         }
     }
@@ -1616,8 +1619,9 @@ contract ArbitrageManagerExtendedTest is Test {
 
         // Should handle timestamp overflow gracefully
         try arbitrageManager.executeArbitrage() {
-            // Success - no overflow issues
-        } catch {
+        // Success - no overflow issues
+        }
+            catch {
             // Failed - overflow protection or other issue
         }
     }

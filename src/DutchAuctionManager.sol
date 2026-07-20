@@ -3,20 +3,18 @@ pragma solidity ^0.8.19;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Constants} from "./Constants.sol";
 import {IDutchAuctionManager} from "./interfaces/IDutchAuctionManager.sol";
 import {IPriceOracle} from "./interfaces/IPriceOracle.sol";
 import {ICollateralManager} from "./interfaces/ICollateralManager.sol";
+import {IStableGuard} from "./interfaces/IStableGuard.sol";
 
 /// @title DutchAuctionManager - Ultra Gas Optimized with Enhanced Security
-/// @dev Implements reentrancy protection and robust validation patterns
-contract DutchAuctionManager is IDutchAuctionManager, ReentrancyGuard {
-    // ============ ULTRA-COMPACT ERRORS ============
-    error AuctionExpired();
-
-    // ============ ULTRA-PACKED CONSTANTS ============
-    uint256 private constant INCENTIVE_PER_CLEANUP = 1e16; // 0.01 ETH
-
+/// @dev Implements reentrancy protection and robust validation patterns.
+///      Bids are paid in SGD; winning a bid settles the liquidated user's debt
+///      in StableGuard and seizes collateral held by the CollateralManager.
+contract DutchAuctionManager is IDutchAuctionManager, ReentrancyGuard, Ownable {
     // ============ MEV PROTECTION CONSTANTS ============
     uint256 private constant COMMIT_DURATION = 300; // 5 minutes
     uint256 private constant REVEAL_DURATION = 600; // 10 minutes
@@ -25,7 +23,6 @@ contract DutchAuctionManager is IDutchAuctionManager, ReentrancyGuard {
     uint256 private constant FLASHLOAN_PROTECTION_BLOCKS = 2; // 2 blocks protection
 
     // ============ IMMUTABLES ============
-    address public immutable OWNER;
     IPriceOracle public immutable PRICE_ORACLE;
     ICollateralManager public immutable COLLATERAL_MANAGER;
 
@@ -75,11 +72,6 @@ contract DutchAuctionManager is IDutchAuctionManager, ReentrancyGuard {
     event FlashloanDetected(address indexed user, uint256 blockNumber);
 
     // ============ ULTRA-COMPACT MODIFIERS ============
-    modifier onlyOwner() {
-        if (msg.sender != OWNER) revert Unauthorized();
-        _;
-    }
-
     modifier onlyStableGuard() {
         if (msg.sender != stableGuard) revert Unauthorized();
         _;
@@ -117,11 +109,10 @@ contract DutchAuctionManager is IDutchAuctionManager, ReentrancyGuard {
     }
 
     // ============ ULTRA-OPTIMIZED CONSTRUCTOR ============
-    constructor(address _priceOracle, address _collateralManager) {
+    constructor(address _priceOracle, address _collateralManager) Ownable(msg.sender) {
         assembly {
             if or(iszero(_priceOracle), iszero(_collateralManager)) { revert(0, 0) }
         }
-        OWNER = msg.sender;
         PRICE_ORACLE = IPriceOracle(_priceOracle);
         COLLATERAL_MANAGER = ICollateralManager(_collateralManager);
         config = Config({duration: 3600, minPriceFactor: 5000, liquidationBonus: 1000, reserved: 0});
@@ -149,12 +140,26 @@ contract DutchAuctionManager is IDutchAuctionManager, ReentrancyGuard {
         }
 
         // CHECKS: Verify collateral exists
-        uint256 collateralAmount = COLLATERAL_MANAGER.getUserCollateral(user, token);
-        if (collateralAmount == 0) revert NoCollateral();
+        uint256 userCollateral = COLLATERAL_MANAGER.getUserCollateral(user, token);
+        if (userCollateral == 0) revert NoCollateral();
 
         // CHECKS: Verify price oracle is working
         uint256 startPrice = PRICE_ORACLE.getTokenPrice(token);
         if (startPrice == 0) revert InvalidPrice();
+        uint8 tokenDecimals = PRICE_ORACLE.getTokenDecimals(token);
+
+        // Auction only the collateral needed to cover debt + liquidation bonus at
+        // the start price (in the token's own decimals), capped at the balance.
+        uint256 targetValue = debtAmount + (debtAmount * config.liquidationBonus) / 10000; // USD, 1e18
+        uint256 collateralNeeded = (targetValue * (10 ** tokenDecimals)) / startPrice;
+        uint256 collateralAmount = collateralNeeded < userCollateral ? collateralNeeded : userCollateral;
+        if (collateralAmount == 0) revert NoCollateral();
+
+        // The DutchAuction struct packs debt and collateral into uint96; reject
+        // values that would truncate rather than silently storing a wrong auction.
+        if (debtAmount > type(uint96).max || collateralAmount > type(uint96).max || startPrice > type(uint128).max) {
+            revert InvalidParameters();
+        }
 
         // EFFECTS: Update state before external interactions
         auctionId = nextAuctionId++;
@@ -168,7 +173,8 @@ contract DutchAuctionManager is IDutchAuctionManager, ReentrancyGuard {
             duration: uint32(config.duration),
             startPrice: uint128(startPrice),
             endPrice: uint128((startPrice * config.minPriceFactor) / 10000),
-            active: true
+            active: true,
+            tokenDecimals: tokenDecimals
         });
 
         userAuctionIds[user].push(auctionId);
@@ -177,10 +183,9 @@ contract DutchAuctionManager is IDutchAuctionManager, ReentrancyGuard {
         emit AuctionEvent(auctionId, user, token, 0, uint128(collateralAmount), uint128(startPrice));
     }
 
-    /// @dev Ultra-optimized bidding with enhanced security
+    /// @dev Ultra-optimized bidding with enhanced security. Paid in SGD.
     function bidOnAuction(uint256 auctionId, uint256 maxPrice)
         external
-        payable
         nonReentrant
         validAuction(auctionId)
         mevProtected(auctionId)
@@ -188,44 +193,7 @@ contract DutchAuctionManager is IDutchAuctionManager, ReentrancyGuard {
         rateLimited
         returns (bool)
     {
-        // CHECKS: Validate auction and calculate current price
-        DutchAuction storage auction = auctions[auctionId];
-
-        // Check if auction has expired
-        if (isAuctionExpired(auctionId)) revert AuctionExpired();
-
-        // Calculate current price
-        uint256 currentPrice = getCurrentPrice(auctionId);
-        if (currentPrice == 0) revert AuctionExpired();
-        if (currentPrice > maxPrice) revert PriceTooHigh();
-
-        // Calculate total cost
-        uint256 totalCost = (currentPrice * auction.collateralAmount) / 1e18;
-
-        // CHECKS: Validate payment
-        if (auction.token == Constants.ETH_TOKEN) {
-            if (msg.value < totalCost) revert InsufficientPayment();
-        } else {
-            if (msg.value != 0) revert InsufficientPayment();
-        }
-
-        // EFFECTS: Update state before external interactions
-        auction.active = false;
-
-        // INTERACTIONS: Handle payments and transfers
-        if (auction.token == Constants.ETH_TOKEN) {
-            unchecked {
-                if (msg.value > totalCost) payable(msg.sender).transfer(msg.value - totalCost);
-            }
-        } else {
-            if (!IERC20(auction.token).transferFrom(msg.sender, address(this), totalCost)) revert TransferFailed();
-        }
-
-        _transferCollateral(auction.user, msg.sender, auction.token, auction.collateralAmount);
-        emit AuctionEvent(
-            auctionId, msg.sender, auction.token, 1, uint128(auction.collateralAmount), uint128(currentPrice)
-        );
-        return true;
+        return _settleBid(auctionId, maxPrice);
     }
 
     /// @dev Ultra-compact auction cancellation
@@ -233,7 +201,6 @@ contract DutchAuctionManager is IDutchAuctionManager, ReentrancyGuard {
         if (!isAuctionExpired(auctionId)) revert AuctionNotExpired();
         auctions[auctionId].active = false;
         emit AuctionEvent(auctionId, msg.sender, auctions[auctionId].token, 2, 0, 0);
-        payable(msg.sender).transfer(INCENTIVE_PER_CLEANUP);
     }
 
     /// @dev Ultra-optimized price calculation with enhanced validation
@@ -286,12 +253,6 @@ contract DutchAuctionManager is IDutchAuctionManager, ReentrancyGuard {
         return nextAuctionId - 1;
     }
 
-    /// @dev Ultra-optimized collateral transfer
-    function _transferCollateral(address, /* from */ address to, address token, uint256 amount) internal {
-        if (token == Constants.ETH_TOKEN) payable(to).transfer(amount);
-        else if (!IERC20(token).transfer(to, amount)) revert TransferFailed();
-    }
-
     // ============ ULTRA-OPTIMIZED ADMIN ============
     function updateConfig(uint64 duration, uint64 minPriceFactor, uint64 liquidationBonus) external onlyOwner {
         assembly {
@@ -299,10 +260,7 @@ contract DutchAuctionManager is IDutchAuctionManager, ReentrancyGuard {
             if or(gt(minPriceFactor, 10000), gt(liquidationBonus, 10000)) { revert(0, 0) }
         }
         config = Config({
-            duration: duration,
-            minPriceFactor: minPriceFactor,
-            liquidationBonus: liquidationBonus,
-            reserved: 0
+            duration: duration, minPriceFactor: minPriceFactor, liquidationBonus: liquidationBonus, reserved: 0
         });
         emit AuctionEvent(0, msg.sender, address(0), 4, uint128(duration), uint128(minPriceFactor));
     }
@@ -323,10 +281,10 @@ contract DutchAuctionManager is IDutchAuctionManager, ReentrancyGuard {
 
         // INTERACTIONS: Transfer funds
         if (token == Constants.ETH_TOKEN) {
-            (bool success,) = payable(OWNER).call{value: amount}("");
+            (bool success,) = payable(owner()).call{value: amount}("");
             if (!success) revert TransferFailed();
         } else {
-            if (!IERC20(token).transfer(OWNER, amount)) revert TransferFailed();
+            if (!IERC20(token).transfer(owner(), amount)) revert TransferFailed();
         }
     }
 
@@ -381,10 +339,9 @@ contract DutchAuctionManager is IDutchAuctionManager, ReentrancyGuard {
         }
 
         if (cleanedCount > 0) {
-            incentive = cleanedCount * INCENTIVE_PER_CLEANUP;
-            payable(msg.sender).transfer(incentive);
-            emit AuctionEvent(0, msg.sender, address(0), 3, uint128(cleanedCount), uint128(incentive));
+            emit AuctionEvent(0, msg.sender, address(0), 3, uint128(cleanedCount), 0);
         }
+        return 0; // No ETH incentives: this contract does not hold ETH
     }
 
     // ============ MEV PROTECTION FUNCTIONS ============
@@ -415,7 +372,6 @@ contract DutchAuctionManager is IDutchAuctionManager, ReentrancyGuard {
     /// @dev Reveal bid with MEV protection
     function revealAndBid(bytes32 commitId, uint256 auctionId, uint256 maxPrice, uint256 nonce)
         external
-        payable
         nonReentrant
         validAuction(auctionId)
         mevProtected(auctionId)
@@ -449,40 +405,45 @@ contract DutchAuctionManager is IDutchAuctionManager, ReentrancyGuard {
         emit BidRevealed(commit.commitHash, auctionId, msg.sender, maxPrice);
 
         // Execute bid
-        return _executeBid(auctionId, maxPrice);
+        return _settleBid(auctionId, maxPrice);
     }
 
-    /// @dev Internal bid execution with enhanced security
-    function _executeBid(uint256 auctionId, uint256 maxPrice) internal returns (bool) {
+    /// @dev Single settlement path for both direct and commit-reveal bids.
+    ///      The bidder pays in SGD: the debt portion is forwarded to StableGuard
+    ///      (which burns it), any surplus goes to the liquidated user, and the
+    ///      collateral is seized from the CollateralManager straight to the bidder.
+    function _settleBid(uint256 auctionId, uint256 maxPrice) internal returns (bool) {
         DutchAuction storage auction = auctions[auctionId];
+
+        if (isAuctionExpired(auctionId)) revert AuctionExpired();
         uint256 currentPrice = getCurrentPrice(auctionId);
+        if (currentPrice == 0) revert AuctionExpired();
+        if (currentPrice > maxPrice) revert PriceTooHigh();
 
-        if (currentPrice == 0 || currentPrice > maxPrice) {
-            revert PriceTooHigh();
-        }
+        // Total cost in SGD (1e18): price is USD/token in 1e18, amount in token decimals
+        uint256 totalCost = (currentPrice * auction.collateralAmount) / (10 ** auction.tokenDecimals);
+        if (totalCost == 0) revert InsufficientPayment();
+        uint256 debtSettled = totalCost < auction.debtAmount ? totalCost : auction.debtAmount;
+        uint256 surplus = totalCost - debtSettled;
 
-        uint256 totalCost = (currentPrice * auction.collateralAmount) / 1e18;
-
-        // Validate payment
-        if (auction.token == Constants.ETH_TOKEN) {
-            if (msg.value < totalCost) revert InsufficientPayment();
-        } else {
-            if (msg.value != 0) revert InsufficientPayment();
-        }
-
-        // Update state
+        // EFFECTS: Close the auction before any external interaction
         auction.active = false;
 
-        // Handle transfers
-        if (auction.token == Constants.ETH_TOKEN) {
-            unchecked {
-                if (msg.value > totalCost) payable(msg.sender).transfer(msg.value - totalCost);
-            }
-        } else {
-            if (!IERC20(auction.token).transferFrom(msg.sender, address(this), totalCost)) revert TransferFailed();
-        }
+        // INTERACTIONS (SGD is our own ERC20, no transfer hooks)
+        IERC20 sgd = IERC20(stableGuard);
+        if (!sgd.transferFrom(msg.sender, address(this), totalCost)) revert TransferFailed();
+        // Debt portion is held by StableGuard until processAuctionCompletion burns it
+        if (!sgd.transfer(stableGuard, debtSettled)) revert TransferFailed();
+        // Anything above the outstanding debt belongs to the liquidated user
+        if (surplus > 0 && !sgd.transfer(auction.user, surplus)) revert TransferFailed();
 
-        _transferCollateral(auction.user, msg.sender, auction.token, auction.collateralAmount);
+        // Seize collateral: debit the user's custody, pay the bidder directly
+        COLLATERAL_MANAGER.withdraw(auction.user, auction.token, auction.collateralAmount, msg.sender);
+
+        // Settle the user's debt in the core. A revert here reverts the whole bid:
+        // settlement is atomic by design.
+        IStableGuard(stableGuard).processAuctionCompletion(auction.user, debtSettled);
+
         emit AuctionEvent(
             auctionId, msg.sender, auction.token, 1, uint128(auction.collateralAmount), uint128(currentPrice)
         );
@@ -539,8 +500,7 @@ contract DutchAuctionManager is IDutchAuctionManager, ReentrancyGuard {
     /// @dev Check flashloan protection
     function _checkFlashloanProtection() internal {
         // Simple flashloan detection: check if balance changed significantly in recent blocks
-        // Exclude current transaction's ETH value to avoid false positives
-        uint256 currentBalance = address(this).balance - msg.value;
+        uint256 currentBalance = address(this).balance;
 
         // Check if we're still in protection period from a previous detection
         if (
@@ -585,8 +545,4 @@ contract DutchAuctionManager is IDutchAuctionManager, ReentrancyGuard {
     function getBidderReputation(address bidder) external view returns (uint256) {
         return bidderReputation[bidder];
     }
-
-    // ============ RECEIVE FUNCTION ============
-
-    receive() external payable {}
 }

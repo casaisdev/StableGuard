@@ -40,9 +40,6 @@ contract ArbitrageManager is IArbitrageManager, Ownable, ReentrancyGuard {
 
     // ============ CACHED CONSTANTS ============
 
-    uint256 private constant BASIS_POINTS_CACHED = 10000;
-    uint256 private constant ARBITRAGE_COOLDOWN_CACHED = 300; // 5 minutes
-
     // ============ PACKED STATE VARIABLES ============
 
     // Arbitrage configuration
@@ -81,7 +78,7 @@ contract ArbitrageManager is IArbitrageManager, Ownable, ReentrancyGuard {
 
     // Rate limiting
     mapping(address => uint256) private _lastOperationTime;
-    uint256 private constant OPERATION_COOLDOWN = 60; // 1 minute between operations per user
+    uint256 private constant OPERATION_COOLDOWN = Constants.ARBITRAGE_COOLDOWN; // per-user cooldown
 
     // ============ MODIFIERS WITH ASSEMBLY OPTIMIZATION ============
 
@@ -98,11 +95,6 @@ contract ArbitrageManager is IArbitrageManager, Ownable, ReentrancyGuard {
 
     modifier circuitBreakerCheck() {
         require(!_circuitBreaker.isTripped, "Circuit breaker tripped");
-        _;
-    }
-
-    modifier arbitrageCooldown() {
-        require(block.timestamp >= _arbitrageState.lastArbitrageTime + 300, "Cooldown period");
         _;
     }
 
@@ -328,7 +320,7 @@ contract ArbitrageManager is IArbitrageManager, Ownable, ReentrancyGuard {
         }
 
         // Calculate profit percentage with cached basis points
-        uint256 profitBps = (priceDifference * BASIS_POINTS_CACHED) / prices.chainlinkPrice;
+        uint256 profitBps = (priceDifference * Constants.BASIS_POINTS) / prices.chainlinkPrice;
 
         // Check if arbitrage is profitable
         require(profitBps >= config.minProfitBps, "Insufficient profit");
@@ -463,7 +455,7 @@ contract ArbitrageManager is IArbitrageManager, Ownable, ReentrancyGuard {
         require(amounts.length == 2 && amounts[1] > 0, "Invalid amounts returned");
 
         // Calculate minimum tokens with slippage protection using cached basis points
-        uint256 minTokens = (amounts[1] * (BASIS_POINTS_CACHED - config.maxSlippageBps)) / BASIS_POINTS_CACHED;
+        uint256 minTokens = (amounts[1] * (Constants.BASIS_POINTS - config.maxSlippageBps)) / Constants.BASIS_POINTS;
         require(minTokens > 0, "Minimum tokens too low");
 
         // Execute swap with deadline protection using cached path
@@ -515,7 +507,7 @@ contract ArbitrageManager is IArbitrageManager, Ownable, ReentrancyGuard {
         require(amounts.length == 2 && amounts[1] > 0, "Invalid amounts returned");
 
         // Calculate minimum ETH with slippage protection using cached basis points
-        uint256 minEth = (amounts[1] * (BASIS_POINTS_CACHED - config.maxSlippageBps)) / BASIS_POINTS_CACHED;
+        uint256 minEth = (amounts[1] * (Constants.BASIS_POINTS - config.maxSlippageBps)) / Constants.BASIS_POINTS;
         require(minEth > 0, "Minimum ETH too low");
 
         // Execute swap with deadline protection using cached path
@@ -600,7 +592,7 @@ contract ArbitrageManager is IArbitrageManager, Ownable, ReentrancyGuard {
         }
 
         // Calculate expected profit percentage using cached constant
-        expectedProfit = (priceDifference * BASIS_POINTS_CACHED) / chainlinkPrice;
+        expectedProfit = (priceDifference * Constants.BASIS_POINTS) / chainlinkPrice;
         exists = expectedProfit >= config.minProfitBps;
 
         return (exists, expectedProfit);
@@ -628,10 +620,7 @@ contract ArbitrageManager is IArbitrageManager, Ownable, ReentrancyGuard {
         onlyOwner
     {
         config = IArbitrageManager.ArbitrageConfig({
-            maxTradeSize: _maxTradeSize,
-            minProfitBps: _minProfitBps,
-            maxSlippageBps: _maxSlippageBps,
-            enabled: _enabled
+            maxTradeSize: _maxTradeSize, minProfitBps: _minProfitBps, maxSlippageBps: _maxSlippageBps, enabled: _enabled
         });
 
         emit ConfigUpdated(_maxTradeSize, _minProfitBps, _maxSlippageBps, _enabled);

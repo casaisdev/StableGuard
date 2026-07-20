@@ -89,7 +89,7 @@ StableGuard is an ERC20‑based stable token backed by user collateral. The syst
 - `ArbitrageManager`: detects on‑chain price dislocations and coordinates execution.
 - `Timelock`: delays sensitive owner actions; queue/execute/cancel lifecycle.
 
-## Non‑Production Scope
+## Non-Production Scope
 
 - Portfolio/demo focus: local mocks, no forks or deployments, no external infra.
 - Missing mainnet hardening: governance/multisig, redundant oracles, audits, monitoring.
@@ -107,24 +107,26 @@ graph TD;
     SG --> DAM[DutchAuctionManager];
     SG --> RM[RepegManager];
     SG --> TL[Timelock];
+    RM --> AM;
     AM[ArbitrageManager] --> PO;
     AM --> DEX[Uniswap V2 Router];
-    SG --> AM;
     CM --> PO;
     LM --> CM;
     LM --> SG;
+    DAM --> CM;
+    DAM --> SG;
 ```
 
 ### High‑Level Responsibilities
 
-- `StableGuard`: core token, orchestrates deposit/mint, burn/withdraw, calls liquidation/auction managers.
-- `PriceOracle`: validated price retrieval via aggregator feeds, fallback prices, and decimal handling.
-- `CollateralManager`: per‑user collateral tracking, ETH and ERC20 handling, controlled by StableGuard.
-- `LiquidationManager`: checks safety, performs emergency/direct liquidation; notifies StableGuard.
-- `DutchAuctionManager`: MEV‑aware auction flow to sell collateral against debt.
-- `ArbitrageManager`: detects and executes arbitrage using DEX prices vs oracle.
-- `RepegManager`: monitors deviation and manages repeg operations (configurable).
-- `Timelock`: delayed execution for emergency operations.
+- `StableGuard`: core token, orchestrates deposit/mint, burn/withdraw, and settles liquidations; it is the sole point that mints/burns SGD and the single source of truth for risk parameters.
+- `PriceOracle`: validated price retrieval via aggregator feeds, fallback prices, and decimal-aware token↔USD conversion (`getTokenValueInUsd` / `getTokenAmountFromUsd`).
+- `CollateralManager`: per-user collateral custody, ETH and ERC20 handling; only authorized managers (StableGuard, DutchAuctionManager) can move custody.
+- `LiquidationManager`: pure risk-assessment and conversion math; it reads thresholds from StableGuard and never holds funds or executes liquidations itself.
+- `DutchAuctionManager`: MEV-aware auction; bids are paid in SGD, which settles debt in StableGuard and seizes collateral from the CollateralManager.
+- `ArbitrageManager`: detects and executes arbitrage using DEX prices vs oracle; invoked via RepegManager.
+- `RepegManager`: monitors deviation and manages repeg operations (configurable); ETH and SGD liquidity are tracked in separate pools.
+- `Timelock`: delayed execution wired into StableGuard's governance actions (`updateModules`, `updateConfig`, `updateRepegConfig`).
 
 ## Modules
 
@@ -159,9 +161,9 @@ sequenceDiagram
     participant CM as CollateralManager
     participant PO as PriceOracle
     U->>SG: depositAndMint(token, depositAmount, mintAmount)
+    SG->>PO: getTokenValueInUsd(token, amount)
+    PO-->>SG: usdValue
     SG->>CM: deposit(user, token, amount)
-    CM->>PO: getTokenValueInUsd(token, amount)
-    PO-->>CM: usdValue
     SG->>SG: update position (debt)
     SG-->>U: mint stable tokens
 ```
@@ -304,7 +306,7 @@ sequenceDiagram
     RM-->>C: emit RepegEvent / RepegOperationExecuted
 ```
 
-### Dutch Auction (Commit‑Reveal) Flow
+### Dutch Auction (Commit-Reveal) Flow
 
 ```mermaid
 sequenceDiagram
@@ -424,16 +426,19 @@ sequenceDiagram
 
 ### Parameters Cheat Sheet
 
-- Collateralization:
-  - `minCollateralRatio`: ≥ 150% recommended for conservative setups.
-  - `liquidationThreshold`: 120%–140% depending on asset volatility.
-  - `liquidationPenalty`: 5%–20% to incentivize liquidators without excess.
+Values below are the defaults this repo ships with (see `src/Constants.sol` and each contract's config). Ranges are illustrative guidance for tuning.
+
+- Collateralization (StableGuard.config — the single source of truth):
+  - `minCollateralRatio`: default 15000 bps (150%).
+  - `liquidationThreshold`: default 12000 bps (120%).
+  - `emergencyThreshold`: default 11000 bps (110%).
+  - `maxLiquidationBonus`: default 1000 bps (10%).
 - Oracle:
-  - `maxAge/heartbeat`: 30s–5m for liquid assets; stricter under stress.
-  - `maxDeviation`: 1%–3% vs previous price; tighter for stable assets.
-- Repeg:
-  - `deviationThreshold`: 0.1%–0.5%; `cooldown`: minutes; size caps per window.
-  - `slippageTolerance`: 0.5%–1% depending on DEX liquidity.
+  - Staleness: default 1h (`DEFAULT_MAX_AGE`), shared by validation and `checkFeedHealth`.
+  - `MAX_PRICE_DEVIATION`: 50% vs the previous valid price (fallback beyond that).
+- Repeg (`Constants` defaults):
+  - `REPEG_DEVIATION_THRESHOLD`: 500 bps (5%); `REPEG_COOLDOWN`: 3600s; `MAX_DEVIATION` cap: 2000 bps (20%).
+  - `MAX_ARBITRAGE_SLIPPAGE`: 300 bps (3%); `ARBITRAGE_COOLDOWN`: 60s.
 - Rate limits:
   - Per‑user/global caps tuned to expected throughput; enforce cooldowns.
 - Auctions:
@@ -489,7 +494,6 @@ sequenceDiagram
 ## Repository Structure
 
 ```
-backend/
 ├─ src/
 │  ├─ StableGuard.sol
 │  ├─ PriceOracle.sol
@@ -499,8 +503,13 @@ backend/
 │  ├─ ArbitrageManager.sol
 │  ├─ RepegManager.sol
 │  ├─ Timelock.sol
+│  ├─ Constants.sol
 │  ├─ interfaces/
-│  │  ├─ IPriceOracle.sol, ILiquidationManager.sol, ...
+│  │  ├─ IPriceOracle.sol, ICollateralManager.sol, ILiquidationManager.sol,
+│  │  ├─ IDutchAuctionManager.sol, IArbitrageManager.sol, IRepegManager.sol,
+│  │  ├─ IStableGuard.sol, AggregatorV3Interface.sol
+├─ script/
+│  └─ Deploy.s.sol
 ├─ test/
 │  ├─ PriceOracle.t.sol
 │  ├─ StableGuard.t.sol
@@ -509,9 +518,11 @@ backend/
 │  ├─ DutchAuctionManager.t.sol
 │  ├─ ArbitrageManager.t.sol
 │  ├─ RepegManager.t.sol
-│  └─ Timelock.t.sol
+│  ├─ Timelock.t.sol
+│  └─ Integration.t.sol
 ├─ foundry.toml
 ├─ foundry.lock
+├─ .gitmodules
 ├─ .gitignore
 ├─ LICENSE
 ├─ StableGuard-Whitepaper.pdf
@@ -527,45 +538,41 @@ backend/
 
 ### Dependencies
 
-Dependencies are managed with Foundry and installed into `lib/` when developing locally:
+Dependencies are vendored as pinned git submodules under `lib/`:
 
-- `forge-std` (Foundry standard library)
-- `openzeppelin-contracts`
+- `forge-std` v1.11.0 (Foundry standard library)
+- `openzeppelin-contracts` v5.4.0
 
-Install after cloning:
-
-```bash
-forge install foundry-rs/forge-std
-forge install OpenZeppelin/openzeppelin-contracts
-```
-
-Notes:
-- Versions are pinned in `foundry.lock`; `forge install` respects these pins.
-- `lib/` is not committed; collaborators should run `forge install` after cloning.
+Versions are also recorded in `foundry.lock` and the submodule commits in `.gitmodules`.
 
 ### Install & Build
 
-- Clone the repository.
-- Build the contracts:
+Clone with submodules (or initialize them afterwards), then build:
 
 ```bash
-forge build
-```
+# Fresh clone
+git clone --recurse-submodules <repo-url>
 
-#### Quick Start
+# Or, if already cloned without submodules:
+git submodule update --init --recursive
 
-```bash
-# 1) Initialize Git (required by forge install)
-git init
-
-# 2) Install dependencies into lib/
-forge install foundry-rs/forge-std
-forge install OpenZeppelin/openzeppelin-contracts
-
-# 3) Build and run tests
 forge build
 forge test -vv
 ```
+
+### Deployment
+
+`script/Deploy.s.sol` deploys and wires the full protocol. Because RepegManager and
+ArbitrageManager need the SGD (StableGuard) address in their constructors, the script
+predicts it with `vm.computeCreateAddress` and asserts the prediction after deployment.
+Set `ETH_USD_FEED` for non-mainnet targets (defaults to the mainnet ETH/USD feed):
+
+```bash
+forge script script/Deploy.s.sol --rpc-url <url> --broadcast
+```
+
+The script wires custody authorizations (`setAuthorizedManager`), the StableGuard
+reference on each module (`setStableGuard`), and configures ETH as initial collateral.
 
 ### Tooling & Formatting
 
@@ -575,14 +582,12 @@ forge test -vv
 
 ### Troubleshooting
 
-- Error: `fatal: not a git repository` when running `forge install`.
-  - Fix: run `git init` at the project root and retry `forge install`.
+- Missing dependencies / `Source ... not found` after cloning.
+  - Fix: run `git submodule update --init --recursive`.
 - Stale artifacts or cache.
   - Fix: `forge clean && forge build`.
 - Remappings not found.
   - Fix: check `foundry.toml` (uses `@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/`) and run `forge remappings` to inspect.
-- Forge-only flow (no submodules) but `.gitmodules` shows up.
-  - Fix: remove `.gitmodules` and ensure `lib/` is listed in `.gitignore`.
 
  
 

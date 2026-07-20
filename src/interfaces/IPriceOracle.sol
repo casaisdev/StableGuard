@@ -41,6 +41,8 @@ interface IPriceOracle {
     function isSupportedToken(address token) external view returns (bool);
     function getSupportedTokens() external view returns (address[] memory);
     function getTokenValueInUsd(address token, uint256 amount) external returns (uint256);
+    /// @dev Convert a USD value (1e18) into a token amount in the token's own decimals
+    function getTokenAmountFromUsd(address token, uint256 usdValue) external returns (uint256);
     function getTokenConfig(address token)
         external
         view

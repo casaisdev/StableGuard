@@ -9,15 +9,17 @@ import {IPriceOracle} from "../src/interfaces/IPriceOracle.sol";
 import {ICollateralManager} from "../src/interfaces/ICollateralManager.sol";
 import {Constants} from "../src/Constants.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
 contract DutchAuctionManagerTest is Test {
     DutchAuctionManager public auctionManager;
     MockPriceOracle public priceOracle;
     MockCollateralManager public collateralManager;
     MockERC20 public mockToken;
+    MockStableGuardSGD public stableGuardSGD;
 
     address public owner = address(0x1);
-    address public stableGuard = address(0x2);
+    address public stableGuard; // address of stableGuardSGD (the SGD token + settlement mock)
     address public user = address(0x3);
     address public bidder = address(0x4);
     address public bidder2 = address(0x5);
@@ -46,11 +48,13 @@ contract DutchAuctionManagerTest is Test {
         priceOracle = new MockPriceOracle();
         collateralManager = new MockCollateralManager();
         mockToken = new MockERC20("Mock Token", "MTK");
+        stableGuardSGD = new MockStableGuardSGD();
+        stableGuard = address(stableGuardSGD);
 
         // Deploy DutchAuctionManager
         auctionManager = new DutchAuctionManager(address(priceOracle), address(collateralManager));
 
-        // Set StableGuard
+        // Set StableGuard (also the SGD token bids are paid in)
         auctionManager.setStableGuard(stableGuard);
 
         // Setup initial state
@@ -60,22 +64,43 @@ contract DutchAuctionManagerTest is Test {
         collateralManager.setUserCollateral(user, address(mockToken), DEFAULT_COLLATERAL_AMOUNT);
         collateralManager.setUserCollateral(user, Constants.ETH_TOKEN, DEFAULT_COLLATERAL_AMOUNT);
 
-        // Fund accounts
-        vm.deal(address(auctionManager), 50 ether); // Sufficient for 10 ETH collateral + some buffer
-        vm.deal(bidder, INITIAL_ETH_BALANCE);
-        vm.deal(bidder2, INITIAL_ETH_BALANCE);
+        // The CollateralManager custodies the assets it pays out on seizure
+        vm.deal(address(collateralManager), 50 ether);
+        mockToken.mint(address(collateralManager), INITIAL_TOKEN_BALANCE);
 
+        // Tokens held by the auction manager itself (for emergencyWithdraw tests)
         mockToken.mint(address(auctionManager), INITIAL_TOKEN_BALANCE);
-        mockToken.mint(bidder, INITIAL_TOKEN_BALANCE);
-        mockToken.mint(bidder2, INITIAL_TOKEN_BALANCE);
 
         vm.stopPrank();
+
+        // Bidders hold SGD and pre-approve the auction manager
+        stableGuardSGD.mint(bidder, INITIAL_TOKEN_BALANCE);
+        stableGuardSGD.mint(bidder2, INITIAL_TOKEN_BALANCE);
+        vm.prank(bidder);
+        stableGuardSGD.approve(address(auctionManager), type(uint256).max);
+        vm.prank(bidder2);
+        stableGuardSGD.approve(address(auctionManager), type(uint256).max);
+    }
+
+    // ============ HELPERS ============
+
+    /// @dev Bid cost in SGD for an auction at the current price
+    function _costOf(uint256 auctionId) internal view returns (uint256) {
+        IDutchAuctionManager.DutchAuction memory a = auctionManager.getAuction(auctionId);
+        return (auctionManager.getCurrentPrice(auctionId) * a.collateralAmount) / (10 ** a.tokenDecimals);
+    }
+
+    /// @dev Mint SGD to a bidder and approve the auction manager
+    function _fundAndApprove(address _bidder, uint256 amount) internal {
+        stableGuardSGD.mint(_bidder, amount);
+        vm.prank(_bidder);
+        stableGuardSGD.approve(address(auctionManager), type(uint256).max);
     }
 
     // ============ BASIC FUNCTIONALITY TESTS ============
 
     function test_Constructor() public view {
-        assertEq(auctionManager.OWNER(), owner);
+        assertEq(auctionManager.owner(), owner);
         assertEq(address(auctionManager.PRICE_ORACLE()), address(priceOracle));
         assertEq(address(auctionManager.COLLATERAL_MANAGER()), address(collateralManager));
         assertEq(auctionManager.stableGuard(), stableGuard);
@@ -97,7 +122,7 @@ contract DutchAuctionManagerTest is Test {
 
     function test_SetStableGuard_OnlyOwner() public {
         vm.prank(user);
-        vm.expectRevert(IDutchAuctionManager.Unauthorized.selector);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, user));
         auctionManager.setStableGuard(address(0x999));
     }
 
@@ -185,12 +210,12 @@ contract DutchAuctionManagerTest is Test {
         vm.prank(stableGuard);
         uint256 auctionId = auctionManager.startDutchAuction(user, Constants.ETH_TOKEN, DEFAULT_DEBT_AMOUNT);
 
-        // Calculate expected cost
+        // Calculate expected cost in SGD
         uint256 currentPrice = auctionManager.getCurrentPrice(auctionId);
         uint256 expectedCost = (currentPrice * DEFAULT_COLLATERAL_AMOUNT) / 1e18;
 
-        uint256 bidderBalanceBefore = bidder.balance;
-        uint256 auctionBalanceBefore = address(auctionManager).balance;
+        uint256 bidderEthBefore = bidder.balance;
+        uint256 bidderSgdBefore = stableGuardSGD.balanceOf(bidder);
 
         vm.prank(bidder);
         vm.expectEmit(true, true, true, true);
@@ -198,11 +223,17 @@ contract DutchAuctionManagerTest is Test {
             auctionId, bidder, Constants.ETH_TOKEN, 1, uint128(DEFAULT_COLLATERAL_AMOUNT), uint128(currentPrice)
         );
 
-        bool success = auctionManager.bidOnAuction{value: expectedCost}(auctionId, currentPrice);
+        bool success = auctionManager.bidOnAuction(auctionId, currentPrice);
 
         assertTrue(success);
-        assertEq(bidder.balance, bidderBalanceBefore - expectedCost + DEFAULT_COLLATERAL_AMOUNT);
-        assertEq(address(auctionManager).balance, auctionBalanceBefore + expectedCost - DEFAULT_COLLATERAL_AMOUNT);
+        // Bidder paid SGD and received the ETH collateral from custody
+        assertEq(stableGuardSGD.balanceOf(bidder), bidderSgdBefore - expectedCost);
+        assertEq(bidder.balance, bidderEthBefore + DEFAULT_COLLATERAL_AMOUNT);
+        // User's custody was debited
+        assertEq(collateralManager.userCollateral(user, Constants.ETH_TOKEN), 0);
+        // Debt was settled in StableGuard with the full cost (cost < debt here)
+        assertEq(stableGuardSGD.settledDebt(user), expectedCost);
+        assertEq(stableGuardSGD.balanceOf(stableGuard), expectedCost);
 
         // Auction should be inactive
         IDutchAuctionManager.DutchAuction memory auction = auctionManager.getAuction(auctionId);
@@ -217,21 +248,18 @@ contract DutchAuctionManagerTest is Test {
         uint256 currentPrice = auctionManager.getCurrentPrice(auctionId);
         uint256 expectedCost = (currentPrice * DEFAULT_COLLATERAL_AMOUNT) / 1e18;
 
-        vm.startPrank(bidder);
-        mockToken.approve(address(auctionManager), expectedCost);
+        uint256 bidderTokenBefore = mockToken.balanceOf(bidder);
+        uint256 bidderSgdBefore = stableGuardSGD.balanceOf(bidder);
 
-        uint256 bidderTokenBalanceBefore = mockToken.balanceOf(bidder);
-        uint256 auctionTokenBalanceBefore = mockToken.balanceOf(address(auctionManager));
-
+        vm.prank(bidder);
         bool success = auctionManager.bidOnAuction(auctionId, currentPrice);
-        vm.stopPrank();
 
         assertTrue(success);
-        assertEq(mockToken.balanceOf(bidder), bidderTokenBalanceBefore - expectedCost + DEFAULT_COLLATERAL_AMOUNT);
-        assertEq(
-            mockToken.balanceOf(address(auctionManager)),
-            auctionTokenBalanceBefore + expectedCost - DEFAULT_COLLATERAL_AMOUNT
-        );
+        // Bidder paid SGD and received the token collateral from custody
+        assertEq(stableGuardSGD.balanceOf(bidder), bidderSgdBefore - expectedCost);
+        assertEq(mockToken.balanceOf(bidder), bidderTokenBefore + DEFAULT_COLLATERAL_AMOUNT);
+        assertEq(collateralManager.userCollateral(user, address(mockToken)), 0);
+        assertEq(stableGuardSGD.settledDebt(user), expectedCost);
     }
 
     function test_BidOnAuction_PriceDecreases() public {
@@ -252,7 +280,7 @@ contract DutchAuctionManagerTest is Test {
     function test_BidOnAuction_InvalidAuction() public {
         vm.prank(bidder);
         vm.expectRevert(IDutchAuctionManager.InvalidParameters.selector);
-        auctionManager.bidOnAuction{value: 1 ether}(999, 1 ether);
+        auctionManager.bidOnAuction(999, 1 ether);
     }
 
     function test_BidOnAuction_ExpiredAuction() public {
@@ -265,7 +293,7 @@ contract DutchAuctionManagerTest is Test {
 
         vm.prank(bidder);
         vm.expectRevert();
-        auctionManager.bidOnAuction{value: 1 ether}(auctionId, 1 ether);
+        auctionManager.bidOnAuction(auctionId, 1 ether);
     }
 
     function test_BidOnAuction_PriceTooHigh() public {
@@ -278,38 +306,43 @@ contract DutchAuctionManagerTest is Test {
 
         vm.prank(bidder);
         vm.expectRevert();
-        auctionManager.bidOnAuction{value: 1 ether}(auctionId, lowMaxPrice);
+        auctionManager.bidOnAuction(auctionId, lowMaxPrice);
     }
 
-    function test_BidOnAuction_InsufficientPayment_ETH() public {
+    function test_BidOnAuction_InsufficientSgd() public {
         // Start auction
         vm.prank(stableGuard);
         uint256 auctionId = auctionManager.startDutchAuction(user, Constants.ETH_TOKEN, DEFAULT_DEBT_AMOUNT);
 
         uint256 currentPrice = auctionManager.getCurrentPrice(auctionId);
-        uint256 expectedCost = (currentPrice * DEFAULT_COLLATERAL_AMOUNT) / 1e18;
 
-        vm.prank(bidder);
-        vm.expectRevert(IDutchAuctionManager.InsufficientPayment.selector);
-        auctionManager.bidOnAuction{value: expectedCost - 1}(auctionId, currentPrice);
+        // A bidder without SGD (or approval) cannot settle the bid
+        address brokeBidder = makeAddr("brokeBidder");
+        vm.prank(brokeBidder);
+        vm.expectRevert();
+        auctionManager.bidOnAuction(auctionId, currentPrice);
     }
 
-    function test_BidOnAuction_ExcessPayment_ETH() public {
-        // Start auction
+    function test_BidOnAuction_SurplusPaidToLiquidatedUser() public {
+        // Small debt vs collateral: the auction only takes debt + 10% bonus worth
+        uint256 smallDebt = 1e18; // $1
         vm.prank(stableGuard);
-        uint256 auctionId = auctionManager.startDutchAuction(user, Constants.ETH_TOKEN, DEFAULT_DEBT_AMOUNT);
+        uint256 auctionId = auctionManager.startDutchAuction(user, Constants.ETH_TOKEN, smallDebt);
 
+        IDutchAuctionManager.DutchAuction memory auction = auctionManager.getAuction(auctionId);
+        // Partial collateral: (1 + 10%) USD at $1/token with 18 decimals = 1.1 tokens
+        assertEq(auction.collateralAmount, 1.1e18);
+
+        uint256 cost = _costOf(auctionId); // 1.1 SGD at start price
+        uint256 userSgdBefore = stableGuardSGD.balanceOf(user);
         uint256 currentPrice = auctionManager.getCurrentPrice(auctionId);
-        uint256 expectedCost = (currentPrice * DEFAULT_COLLATERAL_AMOUNT) / 1e18;
-        uint256 excessPayment = 1 ether;
-
-        uint256 bidderBalanceBefore = bidder.balance;
 
         vm.prank(bidder);
-        auctionManager.bidOnAuction{value: expectedCost + excessPayment}(auctionId, currentPrice);
+        auctionManager.bidOnAuction(auctionId, currentPrice);
 
-        // Should receive excess back
-        assertEq(bidder.balance, bidderBalanceBefore - expectedCost + DEFAULT_COLLATERAL_AMOUNT);
+        // The debt portion settles; the excess above the debt goes to the user
+        assertEq(stableGuardSGD.settledDebt(user), smallDebt);
+        assertEq(stableGuardSGD.balanceOf(user), userSgdBefore + (cost - smallDebt));
     }
 
     // ============ PRICE CALCULATION TESTS ============
@@ -465,18 +498,13 @@ contract DutchAuctionManagerTest is Test {
         // Wait for expiration
         vm.warp(block.timestamp + 3601);
 
-        uint256 cleanerBalanceBefore = address(0x999).balance;
-
         vm.prank(address(0x999));
         vm.expectEmit(true, true, true, true);
         emit AuctionEvent(auctionId, address(0x999), Constants.ETH_TOKEN, 2, 0, 0);
 
         auctionManager.cancelExpiredAuction(auctionId);
 
-        // Should receive incentive
-        assertEq(address(0x999).balance, cleanerBalanceBefore + 0.01 ether);
-
-        // Auction should be inactive
+        // Auction should be inactive (no ETH incentive: the manager holds no ETH)
         IDutchAuctionManager.DutchAuction memory auction = auctionManager.getAuction(auctionId);
         assertFalse(auction.active);
     }
@@ -505,16 +533,13 @@ contract DutchAuctionManagerTest is Test {
         auctionIds[0] = auctionId1;
         auctionIds[1] = auctionId2;
 
-        uint256 cleanerBalanceBefore = address(0x999).balance;
-
         vm.prank(address(0x999));
         vm.expectEmit(true, true, true, true);
-        emit AuctionEvent(0, address(0x999), address(0), 3, 2, uint128(0.02 ether));
+        emit AuctionEvent(0, address(0x999), address(0), 3, 2, 0);
 
         uint256 incentive = auctionManager.cleanExpiredAuctions(auctionIds);
 
-        assertEq(incentive, 0.02 ether); // 2 auctions * 0.01 ETH
-        assertEq(address(0x999).balance, cleanerBalanceBefore + 0.02 ether);
+        assertEq(incentive, 0); // No ETH incentives anymore
 
         // Both auctions should be inactive
         assertFalse(auctionManager.getAuction(auctionId1).active);
@@ -529,13 +554,11 @@ contract DutchAuctionManagerTest is Test {
         uint256[] memory auctionIds = new uint256[](1);
         auctionIds[0] = auctionId;
 
-        uint256 cleanerBalanceBefore = address(0x999).balance;
-
         vm.prank(address(0x999));
         uint256 incentive = auctionManager.cleanExpiredAuctions(auctionIds);
 
         assertEq(incentive, 0);
-        assertEq(address(0x999).balance, cleanerBalanceBefore);
+        assertTrue(auctionManager.getAuction(auctionId).active); // Not expired -> untouched
     }
 
     // ============ ADMIN FUNCTIONS TESTS ============
@@ -559,7 +582,7 @@ contract DutchAuctionManagerTest is Test {
 
     function test_updateConfig_OnlyOwner() public {
         vm.prank(user);
-        vm.expectRevert(IDutchAuctionManager.Unauthorized.selector);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, user));
         auctionManager.updateConfig(7200, 3000, 1500);
     }
 
@@ -615,7 +638,7 @@ contract DutchAuctionManagerTest is Test {
 
     function test_emergencyWithdraw_OnlyOwner() public {
         vm.prank(user);
-        vm.expectRevert(IDutchAuctionManager.Unauthorized.selector);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, user));
         auctionManager.emergencyWithdraw(Constants.ETH_TOKEN, 1 ether);
     }
 
@@ -677,176 +700,48 @@ contract DutchAuctionManagerTest is Test {
     }
 
     function test_revealAndBid() public {
-        console.log("=== Starting test_revealAndBid ===");
+        // Clean environment
+        vm.warp(1000000);
+        vm.roll(1000);
 
-        // Create a completely fresh test environment
-        vm.warp(1000000); // Set to a clean timestamp
-        vm.roll(1000); // Set to a clean block number
-        console.log("Initial timestamp:", block.timestamp);
-        console.log("Initial block number:", block.number);
-
-        // Use a completely fresh bidder
+        // Fresh bidder funded with SGD
         address testBidder = address(0xABCD);
-        vm.deal(testBidder, 2000 ether);
-        console.log("Test bidder:", testBidder);
-        console.log("Test bidder balance:", testBidder.balance);
+        _fundAndApprove(testBidder, 1_000_000e18);
 
         // Start auction
-        console.log("Starting auction...");
         vm.prank(stableGuard);
         uint256 auctionId = auctionManager.startDutchAuction(user, Constants.ETH_TOKEN, DEFAULT_DEBT_AMOUNT);
-        console.log("Auction ID:", auctionId);
-        console.log("Auction started successfully");
 
-        uint256 maxPrice = 2 ether; // Appropriate for 10 ETH collateral
+        uint256 maxPrice = 2 ether;
         uint256 nonce = 456;
-        // Generate commitHash exactly like the contract does in assembly
-        bytes32 commitHash;
-        assembly {
-            let ptr := mload(0x40)
-            mstore(ptr, testBidder)
-            mstore(add(ptr, 0x20), auctionId)
-            mstore(add(ptr, 0x40), maxPrice)
-            mstore(add(ptr, 0x60), nonce)
-            commitHash := keccak256(ptr, 0x80)
-        }
-        console.log("Max price:", maxPrice);
-        console.log("Nonce:", nonce);
-        console.log("Commit hash:", uint256(commitHash));
+        // Same layout the contract hashes in assembly
+        bytes32 commitHash = keccak256(abi.encode(testBidder, auctionId, maxPrice, nonce));
 
-        // Commit bid
-        console.log("Committing bid...");
+        // Commit
         vm.prank(testBidder);
         auctionManager.commitBid(commitHash, auctionId);
-        console.log("Bid committed successfully");
+        bytes32 commitId = keccak256(abi.encode(testBidder, auctionId, block.timestamp));
 
-        // Generate commitId using the actual timestamp when commit was made
-        // This matches the contract's assembly logic: keccak256(caller, auctionId, timestamp)
-        uint256 actualCommitTime = block.timestamp;
-        bytes32 commitId = keccak256(abi.encode(testBidder, auctionId, actualCommitTime));
-        console.log("Actual commit time:", actualCommitTime);
-        console.log("Generated commitId:", uint256(commitId));
-
-        // Wait for commit duration (300 seconds) + 1
-        uint256 newTimestamp = actualCommitTime + 301;
-        vm.warp(newTimestamp);
-        console.log("Warped to timestamp:", block.timestamp);
-        console.log("Time elapsed since commit:", block.timestamp - actualCommitTime);
+        // Wait out the 300s commit period, stay inside the 600s reveal window
+        vm.warp(block.timestamp + 301);
 
         uint256 currentPrice = auctionManager.getCurrentPrice(auctionId);
-        uint256 cost = (currentPrice * DEFAULT_COLLATERAL_AMOUNT) / 1e18;
-        console.log("Current price:", currentPrice);
-        console.log("DEFAULT_COLLATERAL_AMOUNT:", DEFAULT_COLLATERAL_AMOUNT);
-        console.log("Calculated cost:", cost);
-
-        // Ensure we have enough ETH and the price is reasonable
         assertGt(currentPrice, 0, "Price should be > 0");
         assertLe(currentPrice, maxPrice, "Price should be <= maxPrice");
-        assertGe(testBidder.balance, cost, "Bidder should have enough ETH");
-        console.log("All assertions passed");
+        uint256 cost = _costOf(auctionId);
 
-        // Check commit details before reveal
-        console.log("=== Checking commit details ===");
-        console.log("Current timestamp:", block.timestamp);
-        console.log("Expected reveal deadline:", actualCommitTime + 600); // REVEAL_DURATION
-        console.log("Expected commit end time:", actualCommitTime + 300); // COMMIT_DURATION
-        console.log("Time since commit:", block.timestamp - actualCommitTime);
+        uint256 bidderEthBefore = testBidder.balance;
+        uint256 bidderSgdBefore = stableGuardSGD.balanceOf(testBidder);
 
-        // Verify timing conditions
-        require(block.timestamp >= actualCommitTime + 300, "Commit period should be ended");
-        require(block.timestamp <= actualCommitTime + 600, "Should be within reveal deadline");
-        console.log("Timing validations passed");
-
-        // Check current price vs maxPrice
-        uint256 currentPriceCheck = auctionManager.getCurrentPrice(auctionId);
-        console.log("Current price from contract:", currentPriceCheck);
-        console.log("Max price:", maxPrice);
-        require(currentPriceCheck <= maxPrice, "Current price should be <= maxPrice");
-        require(currentPriceCheck > 0, "Current price should be > 0");
-        console.log("Price validation passed");
-
-        // Check rate limiting state
-        console.log("=== Checking rate limiting ===");
-        console.log("Current timestamp:", block.timestamp);
-        console.log("Test bidder address:", testBidder);
-
-        // Check if testBidder has any previous activity by checking lastBidderActivity
-        // We can access this since it's a public mapping
-        uint256 lastActivity = auctionManager.lastBidderActivity(testBidder);
-        console.log("Last bidder activity:", lastActivity);
-
-        if (lastActivity > 0) {
-            uint256 timeSinceLastActivity = block.timestamp - lastActivity;
-            console.log("Time since last activity:", timeSinceLastActivity);
-            console.log("MIN_BID_DELAY is 12 seconds");
-
-            if (timeSinceLastActivity < 12) {
-                uint256 timeToWait = 12 - timeSinceLastActivity + 1; // Add 1 second buffer
-                console.log("Need to wait additional seconds:", timeToWait);
-                vm.warp(block.timestamp + timeToWait);
-                console.log("Advanced time to clear rate limiting, new timestamp:", block.timestamp);
-            } else {
-                console.log("Rate limiting already cleared");
-            }
-        } else {
-            console.log("No previous activity, rate limiting not applicable");
-        }
-
-        console.log("=== Checking MEV protection ===");
-        console.log("Current block number:", block.number);
-        // Get MEV protection struct and log its values
-        console.log("Getting MEV protection info for auction:", auctionId);
-
-        // Get the MEV protection struct
-        DutchAuctionManager.MevProtection memory mevProt = auctionManager.getMevProtection(auctionId);
-        console.log("MEV Protection - lastBidTime:", mevProt.lastBidTime);
-        console.log("MEV Protection - lastBidBlock:", mevProt.lastBidBlock);
-        console.log("MEV Protection - priceImpact:", mevProt.priceImpact);
-        console.log("MEV Protection - flashloanBlock:", mevProt.flashloanBlock);
-
-        // Log current block and timestamp for comparison
-        console.log("Current block.number:", block.number);
-        console.log("Current block.timestamp:", block.timestamp);
-
-        // Check flashloan protection state
-        console.log("=== Checking flashloan protection ===");
-        console.log("Contract balance:", address(auctionManager).balance);
-        console.log("Global flashloanBlock (mevProtection[0]):", auctionManager.getMevProtection(0).flashloanBlock);
-        console.log("FLASHLOAN_PROTECTION_BLOCKS: 2");
-        console.log("Protection check: block.number <= flashloanBlock + 2");
-        console.log("Protection check:", block.number, "<=", auctionManager.getMevProtection(0).flashloanBlock + 2);
-        console.log("Protection active:", block.number <= auctionManager.getMevProtection(0).flashloanBlock + 2);
-
-        // Check contract balance vs collateral amount
-        console.log("=== Checking contract balance vs collateral ===");
-        console.log("Contract ETH balance:", address(auctionManager).balance);
-        console.log("Collateral amount to transfer:", DEFAULT_COLLATERAL_AMOUNT);
-        console.log("Balance sufficient?", address(auctionManager).balance >= DEFAULT_COLLATERAL_AMOUNT);
-
-        // Try the reveal and bid
-        console.log("Attempting revealAndBid...");
-        console.log("Parameters - commitId:", uint256(commitId));
-        console.log("Parameters - auctionId:", auctionId);
-        console.log("Parameters - maxPrice:", maxPrice);
-        console.log("Parameters - nonce:", nonce);
-        console.log("Parameters - value (cost):", cost);
-
-        // First try to capture the revert reason
+        // Reveal and execute the bid (paid in SGD)
         vm.prank(testBidder);
-        try auctionManager.revealAndBid{value: cost}(commitId, auctionId, maxPrice, nonce) returns (bool success) {
-            console.log("revealAndBid result:", success);
-            assertTrue(success, "revealAndBid should succeed");
-            console.log("=== Test completed successfully ===");
-        } catch Error(string memory reason) {
-            console.log("Revert reason:", reason);
-            revert(string(abi.encodePacked("revealAndBid failed with reason: ", reason)));
-        } catch (bytes memory lowLevelData) {
-            console.log("Low level revert data length:", lowLevelData.length);
-            if (lowLevelData.length > 0) {
-                console.logBytes(lowLevelData);
-            }
-            revert("revealAndBid failed with low level revert");
-        }
+        bool success = auctionManager.revealAndBid(commitId, auctionId, maxPrice, nonce);
+
+        assertTrue(success, "revealAndBid should succeed");
+        assertFalse(auctionManager.isAuctionActive(auctionId));
+        assertEq(stableGuardSGD.balanceOf(testBidder), bidderSgdBefore - cost);
+        assertEq(testBidder.balance, bidderEthBefore + DEFAULT_COLLATERAL_AMOUNT);
+        assertEq(stableGuardSGD.settledDebt(user), cost);
     }
 
     // ============ RATE LIMITING TESTS ============
@@ -857,30 +752,25 @@ contract DutchAuctionManagerTest is Test {
         uint256 auctionId = auctionManager.startDutchAuction(user, Constants.ETH_TOKEN, DEFAULT_DEBT_AMOUNT);
 
         uint256 currentPrice = auctionManager.getCurrentPrice(auctionId);
-        uint256 expectedCost = (currentPrice * DEFAULT_COLLATERAL_AMOUNT) / 1e18;
 
         // First bid should succeed
         vm.prank(bidder);
-        auctionManager.bidOnAuction{value: expectedCost}(auctionId, currentPrice);
+        auctionManager.bidOnAuction(auctionId, currentPrice);
 
         // Start another auction for second bid test
         vm.prank(stableGuard);
         uint256 auctionId2 = auctionManager.startDutchAuction(user, address(mockToken), DEFAULT_DEBT_AMOUNT);
 
         // Immediate second bid should fail due to rate limiting
-        vm.startPrank(bidder);
-        mockToken.approve(address(auctionManager), expectedCost);
+        vm.prank(bidder);
         vm.expectRevert("Rate limited");
         auctionManager.bidOnAuction(auctionId2, currentPrice);
-        vm.stopPrank();
 
         // After waiting, should succeed
         vm.warp(block.timestamp + 13); // Wait 13 seconds
 
-        vm.startPrank(bidder);
-        mockToken.approve(address(auctionManager), expectedCost);
+        vm.prank(bidder);
         bool success = auctionManager.bidOnAuction(auctionId2, currentPrice);
-        vm.stopPrank();
 
         assertTrue(success);
     }
@@ -896,11 +786,10 @@ contract DutchAuctionManagerTest is Test {
         vm.deal(address(auctionManager), 150 ether);
 
         uint256 currentPrice = auctionManager.getCurrentPrice(auctionId);
-        uint256 expectedCost = (currentPrice * DEFAULT_COLLATERAL_AMOUNT) / 1e18;
 
         vm.prank(bidder);
         vm.expectRevert("Flashloan protection active");
-        auctionManager.bidOnAuction{value: expectedCost}(auctionId, currentPrice);
+        auctionManager.bidOnAuction(auctionId, currentPrice);
 
         // After protection period, should work
         vm.roll(block.number + 3); // Wait 3 blocks
@@ -909,7 +798,7 @@ contract DutchAuctionManagerTest is Test {
         vm.deal(address(auctionManager), 0);
 
         vm.prank(bidder);
-        bool success = auctionManager.bidOnAuction{value: expectedCost}(auctionId, currentPrice);
+        bool success = auctionManager.bidOnAuction(auctionId, currentPrice);
         assertTrue(success);
     }
 
@@ -922,10 +811,9 @@ contract DutchAuctionManagerTest is Test {
         uint256 auctionId = auctionManager.startDutchAuction(user, Constants.ETH_TOKEN, DEFAULT_DEBT_AMOUNT);
 
         uint256 currentPrice = auctionManager.getCurrentPrice(auctionId);
-        uint256 expectedCost = (currentPrice * DEFAULT_COLLATERAL_AMOUNT) / 1e18;
 
         vm.prank(bidder);
-        bool success = auctionManager.bidOnAuction{value: expectedCost}(auctionId, currentPrice);
+        bool success = auctionManager.bidOnAuction(auctionId, currentPrice);
         assertTrue(success);
     }
 
@@ -951,16 +839,15 @@ contract DutchAuctionManagerTest is Test {
         uint256 auctionId = auctionManager.startDutchAuction(user, Constants.ETH_TOKEN, DEFAULT_DEBT_AMOUNT);
 
         uint256 currentPrice = auctionManager.getCurrentPrice(auctionId);
-        uint256 expectedCost = (currentPrice * DEFAULT_COLLATERAL_AMOUNT) / 1e18;
 
         // First bidder wins
         vm.prank(bidder);
-        auctionManager.bidOnAuction{value: expectedCost}(auctionId, currentPrice);
+        auctionManager.bidOnAuction(auctionId, currentPrice);
 
         // Second bidder tries to bid on inactive auction
         vm.prank(bidder2);
         vm.expectRevert(IDutchAuctionManager.InvalidParameters.selector);
-        auctionManager.bidOnAuction{value: expectedCost}(auctionId, currentPrice);
+        auctionManager.bidOnAuction(auctionId, currentPrice);
     }
 
     function test_priceCalculationOverflow() public {
@@ -984,29 +871,24 @@ contract DutchAuctionManagerTest is Test {
         uint256 gasUsed = gasBefore - gasleft();
 
         // Should use reasonable amount of gas (adjust threshold as needed)
-        assertLt(gasUsed, 230000);
+        assertLt(gasUsed, 280000);
 
         uint256 currentPrice = auctionManager.getCurrentPrice(auctionId);
-        uint256 expectedCost = (currentPrice * DEFAULT_COLLATERAL_AMOUNT) / 1e18;
 
         vm.prank(bidder);
         gasBefore = gasleft();
-        auctionManager.bidOnAuction{value: expectedCost}(auctionId, currentPrice);
+        auctionManager.bidOnAuction(auctionId, currentPrice);
         gasUsed = gasBefore - gasleft();
 
-        // Bidding should also be gas efficient
-        assertLt(gasUsed, 300000);
+        // Bidding settles debt + seizes collateral in one transaction
+        assertLt(gasUsed, 500000);
     }
 
-    function test_receiveFunction() public {
-        uint256 balanceBefore = address(auctionManager).balance;
-
-        // Send ETH directly to contract
+    function test_noReceiveFunction() public {
+        // The auction manager no longer deals in ETH: direct sends must revert
         vm.deal(address(this), 1 ether);
         (bool success,) = address(auctionManager).call{value: 1 ether}("");
-
-        assertTrue(success);
-        assertEq(address(auctionManager).balance, balanceBefore + 1 ether);
+        assertFalse(success);
     }
 
     // ============ HELPER FUNCTIONS ============
@@ -1021,7 +903,7 @@ contract DutchAuctionManagerTest is Test {
         uint256 auctionId = auctionManager.startDutchAuction(user, Constants.ETH_TOKEN, DEFAULT_DEBT_AMOUNT);
 
         address testBidder = address(0xABCD);
-        vm.deal(testBidder, 100 ether);
+        _fundAndApprove(testBidder, 1_000_000e18);
 
         uint256 maxPrice = 2 ether;
         uint256 correctNonce = 456;
@@ -1040,13 +922,10 @@ contract DutchAuctionManagerTest is Test {
         // Wait for commit period to end
         vm.warp(block.timestamp + 301);
 
-        uint256 currentPrice = auctionManager.getCurrentPrice(auctionId);
-        uint256 cost = (currentPrice * DEFAULT_COLLATERAL_AMOUNT) / 1e18;
-
         // Try to reveal with wrong nonce - should fail
         vm.prank(testBidder);
         vm.expectRevert("Invalid reveal");
-        auctionManager.revealAndBid{value: cost}(commitId, auctionId, maxPrice, wrongNonce);
+        auctionManager.revealAndBid(commitId, auctionId, maxPrice, wrongNonce);
     }
 
     function test_multipleCommitsFromSameUser() public {
@@ -1055,7 +934,7 @@ contract DutchAuctionManagerTest is Test {
         uint256 auctionId = auctionManager.startDutchAuction(user, Constants.ETH_TOKEN, DEFAULT_DEBT_AMOUNT);
 
         address testBidder = address(0xABCD);
-        vm.deal(testBidder, 100 ether);
+        _fundAndApprove(testBidder, 1_000_000e18);
 
         uint256 maxPrice1 = 2 ether;
         uint256 maxPrice2 = 3 ether;
@@ -1082,17 +961,14 @@ contract DutchAuctionManagerTest is Test {
         // Wait for commit period to end
         vm.warp(block.timestamp + 301);
 
-        uint256 currentPrice = auctionManager.getCurrentPrice(auctionId);
-        uint256 cost = (currentPrice * DEFAULT_COLLATERAL_AMOUNT) / 1e18;
-
         // Try to reveal with first commit parameters - should fail
         vm.prank(testBidder);
         vm.expectRevert("Invalid reveal");
-        auctionManager.revealAndBid{value: cost}(commitId, auctionId, maxPrice1, nonce1);
+        auctionManager.revealAndBid(commitId, auctionId, maxPrice1, nonce1);
 
         // Reveal with second commit parameters - should succeed
         vm.prank(testBidder);
-        bool success = auctionManager.revealAndBid{value: cost}(commitId, auctionId, maxPrice2, nonce2);
+        bool success = auctionManager.revealAndBid(commitId, auctionId, maxPrice2, nonce2);
         assertTrue(success);
     }
 
@@ -1109,12 +985,14 @@ contract DutchAuctionManagerTest is Test {
             bidders[i] = address(uint160(0x2000 + i));
 
             // Setup collateral for each user
-            vm.deal(users[i], 100 ether);
             collateralManager.setUserCollateral(users[i], Constants.ETH_TOKEN, DEFAULT_COLLATERAL_AMOUNT);
 
-            // Give bidders ETH
-            vm.deal(bidders[i], 100 ether);
+            // Give bidders SGD
+            _fundAndApprove(bidders[i], 1_000_000e18);
         }
+
+        // Extra ETH so the CollateralManager can pay out all five seizures
+        vm.deal(address(collateralManager), 100 ether);
 
         // Start multiple auctions simultaneously
         vm.startPrank(stableGuard);
@@ -1134,10 +1012,9 @@ contract DutchAuctionManagerTest is Test {
             vm.warp(block.timestamp + (i * 60)); // 1 minute intervals
 
             uint256 currentPrice = auctionManager.getCurrentPrice(auctionIds[i]);
-            uint256 cost = (currentPrice * DEFAULT_COLLATERAL_AMOUNT) / 1e18;
 
             vm.prank(bidders[i]);
-            bool success = auctionManager.bidOnAuction{value: cost}(auctionIds[i], currentPrice);
+            bool success = auctionManager.bidOnAuction(auctionIds[i], currentPrice);
             assertTrue(success);
 
             // Verify auction is now inactive
@@ -1154,7 +1031,7 @@ contract DutchAuctionManagerTest is Test {
         uint256 auctionId = auctionManager.startDutchAuction(user, Constants.ETH_TOKEN, DEFAULT_DEBT_AMOUNT);
 
         address testBidder = address(0xABCD);
-        vm.deal(testBidder, 100 ether);
+        _fundAndApprove(testBidder, 1_000_000e18);
 
         // Simulate a flashloan scenario:
         // 1. Contract receives large amount of ETH (simulating flashloan)
@@ -1163,7 +1040,6 @@ contract DutchAuctionManagerTest is Test {
         // 4. Bidder should be able to bid after protection period
 
         uint256 currentPrice = auctionManager.getCurrentPrice(auctionId);
-        uint256 cost = (currentPrice * DEFAULT_COLLATERAL_AMOUNT) / 1e18;
 
         // Step 1: Simulate flashloan by giving contract large balance
         vm.deal(address(auctionManager), 150 ether); // Exceeds 100 ETH threshold
@@ -1171,17 +1047,17 @@ contract DutchAuctionManagerTest is Test {
         // Step 2: Try to bid during flashloan protection - should fail
         vm.prank(testBidder);
         vm.expectRevert("Flashloan protection active");
-        auctionManager.bidOnAuction{value: cost}(auctionId, currentPrice);
+        auctionManager.bidOnAuction(auctionId, currentPrice);
 
         // Step 3: Advance blocks to clear flashloan protection
         vm.roll(block.number + 3); // Wait 3 blocks (FLASHLOAN_PROTECTION_BLOCKS = 2)
 
         // Step 4: Reduce contract balance to normal level
-        vm.deal(address(auctionManager), 50 ether);
+        vm.deal(address(auctionManager), 0);
 
         // Step 5: Now bid should succeed
         vm.prank(testBidder);
-        bool success = auctionManager.bidOnAuction{value: cost}(auctionId, currentPrice);
+        bool success = auctionManager.bidOnAuction(auctionId, currentPrice);
         assertTrue(success);
 
         // Verify auction completed
@@ -1265,6 +1141,13 @@ contract MockPriceOracle is IPriceOracle {
         return (amount * price) / (10 ** decimals);
     }
 
+    function getTokenAmountFromUsd(address token, uint256 usdValue) external view returns (uint256) {
+        require(supportedTokens[token], "Token not supported");
+        uint8 decimals = tokenDecimals[token];
+        if (decimals == 0) decimals = 18; // Default to 18 decimals
+        return (usdValue * (10 ** decimals)) / prices[token];
+    }
+
     function getTokenConfig(address token)
         external
         view
@@ -1307,7 +1190,13 @@ contract MockPriceOracle is IPriceOracle {
         fallbackPrices[token] = newFallbackPrice;
     }
 
-    function getLastUpdateTime(address /* token */ ) external view returns (uint256) {
+    function getLastUpdateTime(
+        address /* token */
+    )
+        external
+        view
+        returns (uint256)
+    {
         return block.timestamp;
     }
 }
@@ -1331,15 +1220,7 @@ contract MockCollateralManager is ICollateralManager {
         }
     }
 
-    function addCollateralType(
-        address token,
-        address priceFeed,
-        uint256 fallbackPrice,
-        uint8 decimals,
-        uint16 ltv,
-        uint16 liquidationThreshold,
-        uint16 liquidationPenalty
-    ) external {
+    function addCollateralType(address, address, uint256, uint8) external {
         // Mock implementation - just store that it's supported
     }
 
@@ -1348,10 +1229,19 @@ contract MockCollateralManager is ICollateralManager {
         setUserCollateral(user, token, userCollateral[user][token]);
     }
 
-    function withdraw(address user, address token, uint256 amount) external {
+    function withdraw(address user, address token, uint256 amount, address recipient) external {
         require(userCollateral[user][token] >= amount, "Insufficient collateral");
         userCollateral[user][token] -= amount;
+        // Pay the recipient like the real CollateralManager does
+        if (token == address(0)) {
+            (bool ok,) = payable(recipient).call{value: amount}("");
+            require(ok, "ETH transfer failed");
+        } else {
+            require(IERC20(token).transfer(recipient, amount), "Token transfer failed");
+        }
     }
+
+    receive() external payable {}
 
     function getUserCollateral(address user, address token) external view returns (uint256) {
         return userCollateral[user][token];
@@ -1389,7 +1279,13 @@ contract MockCollateralManager is ICollateralManager {
         return collateralValue < minimumCollateral;
     }
 
-    function liquidateCollateral(address user, address, /* token */ uint256 debtValue, uint256 liquidationThreshold)
+    function liquidateCollateral(
+        address user,
+        address,
+        /* token */
+        uint256 debtValue,
+        uint256 liquidationThreshold
+    )
         external
         pure
         returns (bool)
@@ -1459,5 +1355,19 @@ contract MockERC20 is IERC20 {
 
         emit Transfer(from, to, amount);
         return true;
+    }
+}
+
+/// @dev Plays the role of StableGuard for the auction manager: it is both the SGD
+///      token bids are paid in and the settlement endpoint. It records settled
+///      debt per user; the SGD forwarded by the auction manager stays on its
+///      balance (the real contract burns it).
+contract MockStableGuardSGD is MockERC20 {
+    mapping(address => uint256) public settledDebt;
+
+    constructor() MockERC20("StableGuard", "SGD") {}
+
+    function processAuctionCompletion(address user, uint256 debtSettled) external {
+        settledDebt[user] += debtSettled;
     }
 }

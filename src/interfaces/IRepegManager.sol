@@ -48,7 +48,8 @@ interface IRepegManager {
         uint32 timestamp
     );
 
-    event ArbitrageExecuted(uint256 timestamp);
+    /// @dev Distinct name from IArbitrageManager.ArbitrageExecuted (different signature)
+    event RepegArbitrageExecuted(uint256 timestamp);
 
     event RepegOperationExecuted(
         uint128 targetPrice, uint128 currentPrice, uint256 interventionAmount, string strategy, uint256 timestamp
@@ -57,16 +58,20 @@ interface IRepegManager {
     // ============ CORE FUNCTIONS ============
 
     /**
-     * @dev Check if repeg is needed and trigger if conditions are met
+     * @dev Check if repeg is needed and trigger if conditions are met.
+     *      Only callable by StableGuard, which forwards the end user.
+     * @param beneficiary The end user that triggered the repeg (receives the incentive)
      * @return triggered Whether repeg was triggered
      * @return newPrice New price after repeg
      */
-    function checkAndTriggerRepeg() external returns (bool triggered, uint128 newPrice);
+    function checkAndTriggerRepeg(address beneficiary) external returns (bool triggered, uint128 newPrice);
 
     /**
      * @dev Execute repeg with specific parameters
      * @param targetPrice Target price for repeg
-     * @param direction Direction of repeg (0=none, 1=up, 2=down)
+     * @param direction Direction of repeg. Convention used across the whole
+     *        contract: 0 = none, 1 = buy SGD (price below target, pushes it up),
+     *        2 = sell SGD (price above target, pushes it down)
      * @return success Whether repeg was successful
      */
     function executeRepeg(uint128 targetPrice, uint8 direction) external returns (bool success);
@@ -98,18 +103,26 @@ interface IRepegManager {
     // ============ LIQUIDITY FUNCTIONS ============
 
     /**
-     * @dev Provide liquidity to the repeg pool
+     * @dev Provide liquidity to the repeg pool. ETH (via msg.value) and SGD are
+     *      tracked in separate pools; withdrawals repay the deposited asset.
      * @param amount Amount of liquidity to provide
      * @return success Whether provision was successful
      */
     function provideLiquidity(uint256 amount) external payable returns (bool success);
 
     /**
-     * @dev Withdraw liquidity from the repeg pool
-     * @param amount Amount of liquidity to withdraw
+     * @dev Withdraw SGD liquidity from the repeg pool
+     * @param amount Amount of SGD liquidity to withdraw
      * @return success Whether withdrawal was successful
      */
     function withdrawLiquidity(uint256 amount) external returns (bool success);
+
+    /**
+     * @dev Withdraw ETH liquidity from the repeg pool
+     * @param amount Amount of ETH liquidity to withdraw
+     * @return success Whether withdrawal was successful
+     */
+    function withdrawEthLiquidity(uint256 amount) external returns (bool success);
 
     // ============ CONFIGURATION FUNCTIONS ============
 
@@ -186,10 +199,7 @@ interface IRepegManager {
      * @return prices Array of historical prices
      * @return timestamps Array of historical timestamps
      */
-    function getRepegHistory(uint256 count)
-        external
-        view
-        returns (uint128[] memory prices, uint64[] memory timestamps);
+    function getRepegHistory(uint256 count) external view returns (uint128[] memory prices, uint64[] memory timestamps);
 
     /**
      * @dev Check if repeg can be triggered

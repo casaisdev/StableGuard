@@ -26,10 +26,6 @@ interface IArbitrageManager {
         uint256 timestamp
     );
 
-    event ArbitrageOpportunityDetected(
-        address indexed dexFrom, address indexed dexTo, uint256 priceDifference, uint256 potentialProfit
-    );
-
     event ConfigUpdated(uint256 maxTradeSize, uint256 minProfitBps, uint256 maxSlippageBps, bool enabled);
 
     // ============ CORE FUNCTIONS ============

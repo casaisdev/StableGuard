@@ -3,6 +3,7 @@ pragma solidity ^0.8.19;
 
 import {AggregatorV3Interface} from "./interfaces/AggregatorV3Interface.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {IPriceOracle} from "./interfaces/IPriceOracle.sol";
 import {Constants} from "./Constants.sol";
 
@@ -10,7 +11,7 @@ import {Constants} from "./Constants.sol";
  * @title PriceOracle - Ultra Gas Optimized with Enhanced Security
  * @dev Maximum gas efficiency with packed storage and assembly optimizations
  */
-contract PriceOracle is IPriceOracle, ReentrancyGuard {
+contract PriceOracle is IPriceOracle, ReentrancyGuard, Ownable {
     // ============ PACKED STORAGE ============
 
     /// @dev Ultra-optimized token configuration (single slot, better alignment)
@@ -32,17 +33,12 @@ contract PriceOracle is IPriceOracle, ReentrancyGuard {
 
     // ============ CONSTANTS ============
 
-    uint256 private constant PRICE_SCALE = 1e18;
     uint256 private constant CHAINLINK_STALE_THRESHOLD = 3600; // 1 hour
     uint256 private constant DEFAULT_MAX_AGE = 3600; // 1 hour default
     uint256 private constant DEFAULT_HEARTBEAT = 300; // 5 minutes default
     uint256 private constant DEFAULT_GRACE_TIME = 600; // 10 minutes default
-    uint256 private constant MIN_VALID_PRICE = 1e6; // Minimum valid price (prevents dust attacks)
+    uint256 private constant MIN_VALID_PRICE = 1e14; // $0.0001 in 1e18 scale, checked after conversion
     uint256 private constant MAX_PRICE_DEVIATION = 5000; // 50% max deviation from previous price
-
-    // ============ IMMUTABLES ============
-
-    address public immutable OWNER;
 
     // ============ STATE ============
 
@@ -61,11 +57,6 @@ contract PriceOracle is IPriceOracle, ReentrancyGuard {
 
     // ============ MODIFIERS ============
 
-    modifier onlyOwner() {
-        if (msg.sender != OWNER) revert("Only owner");
-        _;
-    }
-
     modifier validToken(address token) {
         if (!_configs[token].isSupported) revert("Unsupported token");
         _;
@@ -73,9 +64,7 @@ contract PriceOracle is IPriceOracle, ReentrancyGuard {
 
     // ============ CONSTRUCTOR ============
 
-    constructor() {
-        OWNER = msg.sender;
-    }
+    constructor() Ownable(msg.sender) {}
 
     // ============ CORE FUNCTIONS ============
 
@@ -114,7 +103,16 @@ contract PriceOracle is IPriceOracle, ReentrancyGuard {
             return chainlinkPrice;
         }
 
-        // Use fallback and emit event
+        // Use fallback and emit events
+        try AggregatorV3Interface(config.priceFeed).latestRoundData() returns (
+            uint80, int256, uint256, uint256 updatedAt, uint80
+        ) {
+            uint256 maxAge = _stalenessThreshold(token);
+            if (updatedAt > 0 && block.timestamp - updatedAt > maxAge) {
+                emit StaleDataDetected(token, updatedAt, maxAge);
+            }
+        } catch {}
+
         price = config.fallbackPrice;
         if (price == 0) revert("No price available");
         emit FallbackPriceUsed(token, price);
@@ -215,9 +213,7 @@ contract PriceOracle is IPriceOracle, ReentrancyGuard {
 
     // ============ INTERNAL FUNCTIONS ============
 
-    function _internalConfigureToken(address token, address priceFeed, uint256 fallbackPrice, uint8 decimals)
-        internal
-    {
+    function _internalConfigureToken(address token, address priceFeed, uint256 fallbackPrice, uint8 decimals) internal {
         // Additional validations for internal configuration
         // Permit ETH sentinel (address(0))
         require(priceFeed != address(0), "Invalid price feed address");
@@ -258,6 +254,12 @@ contract PriceOracle is IPriceOracle, ReentrancyGuard {
         if (amount == 0) return 0;
 
         return (getTokenPrice(token) * amount) / (10 ** getTokenDecimals(token));
+    }
+
+    function getTokenAmountFromUsd(address token, uint256 usdValue) external override returns (uint256) {
+        if (usdValue == 0) return 0;
+
+        return (usdValue * (10 ** getTokenDecimals(token))) / getTokenPrice(token);
     }
 
     function getTokenConfig(address token)
@@ -332,7 +334,7 @@ contract PriceOracle is IPriceOracle, ReentrancyGuard {
         try AggregatorV3Interface(config.priceFeed).latestRoundData() returns (
             uint80, int256 answer, uint256, uint256 updatedAt, uint80
         ) {
-            isHealthy = answer > 0 && (block.timestamp - updatedAt) <= Constants.MAX_PRICE_AGE;
+            isHealthy = answer > 0 && (block.timestamp - updatedAt) <= _stalenessThreshold(token);
             lastUpdate = updatedAt;
         } catch {
             isHealthy = false;
@@ -452,43 +454,13 @@ contract PriceOracle is IPriceOracle, ReentrancyGuard {
             return false;
         }
 
-        // Check minimum price threshold
-        if (uint256(answer) < MIN_VALID_PRICE) {
+        // Freshness validation (same threshold as checkFeedHealth)
+        if (block.timestamp - updatedAt > _stalenessThreshold(token)) {
             return false;
         }
 
-        // Freshness validation
-        FreshnessConfig memory config = _freshnessConfigs[token];
-        uint32 maxAge = config.maxAge > 0 ? config.maxAge : uint32(DEFAULT_MAX_AGE);
-
-        uint256 timeElapsed = block.timestamp - updatedAt;
-
-        if (config.strictMode) {
-            // Strict mode: use heartbeat + grace time
-            uint32 threshold = config.heartbeat + config.graceTime;
-            if (timeElapsed > threshold) {
-                return false;
-            }
-        } else {
-            // Normal mode: use max age
-            if (timeElapsed > maxAge) {
-                return false;
-            }
-        }
-
-        // Price deviation check
-        uint256 lastValidPrice = _lastValidPrices[token];
-        if (lastValidPrice > 0) {
-            uint256 currentPrice = uint256(answer);
-            uint256 deviation = lastValidPrice > currentPrice
-                ? ((lastValidPrice - currentPrice) * 10000) / lastValidPrice
-                : ((currentPrice - lastValidPrice) * 10000) / lastValidPrice;
-
-            if (deviation > MAX_PRICE_DEVIATION) {
-                return false;
-            }
-        }
-
+        // Deviation vs the last valid price is checked in _getSafePrice, after
+        // conversion to 1e18, so both sides of the comparison share one scale.
         return true;
     }
 
@@ -500,10 +472,8 @@ contract PriceOracle is IPriceOracle, ReentrancyGuard {
         view
         returns (bool)
     {
-        return (
-            roundId > 0 && answer > 0 && updatedAt > 0 && answeredInRound >= roundId
-                && block.timestamp - updatedAt <= CHAINLINK_STALE_THRESHOLD
-        );
+        return (roundId > 0 && answer > 0 && updatedAt > 0 && answeredInRound >= roundId
+                && block.timestamp - updatedAt <= CHAINLINK_STALE_THRESHOLD);
     }
 
     /**
@@ -533,24 +503,31 @@ contract PriceOracle is IPriceOracle, ReentrancyGuard {
 
             if (token != address(0) && _validatePriceData(token, roundId, answer, updatedAt, answeredInRound)) {
                 uint8 decimals = aggregator.decimals();
-                price = _convertPrice(answer, decimals);
-                isValid = true;
+                uint256 converted = _convertPrice(answer, decimals);
 
-                // Update last valid price for deviation checks
-                _updateLastValidPrice(token, price);
+                if (converted < MIN_VALID_PRICE) {
+                    return (0, false);
+                }
 
-                // Emit events for monitoring
+                // Deviation check against the previous valid price (both in 1e18)
                 uint256 lastValidPrice = _lastValidPrices[token];
                 if (lastValidPrice > 0) {
-                    uint256 deviation = lastValidPrice > price
-                        ? ((lastValidPrice - price) * 10000) / lastValidPrice
-                        : ((price - lastValidPrice) * 10000) / lastValidPrice;
+                    uint256 deviation = lastValidPrice > converted
+                        ? ((lastValidPrice - converted) * 10000) / lastValidPrice
+                        : ((converted - lastValidPrice) * 10000) / lastValidPrice;
 
+                    if (deviation > MAX_PRICE_DEVIATION) {
+                        return (0, false);
+                    }
                     if (deviation > 1000) {
                         // 10% threshold for event
-                        emit PriceDeviationDetected(token, lastValidPrice, price, deviation);
+                        emit PriceDeviationDetected(token, lastValidPrice, converted, deviation);
                     }
                 }
+
+                _updateLastValidPrice(token, converted);
+                price = converted;
+                isValid = true;
             } else if (_validatePriceData(roundId, answer, updatedAt, answeredInRound)) {
                 // Fallback to legacy validation if token not found
                 uint8 decimals = aggregator.decimals();
@@ -582,8 +559,19 @@ contract PriceOracle is IPriceOracle, ReentrancyGuard {
      * @dev Update last valid price for deviation checks (internal helper)
      */
     function _updateLastValidPrice(address token, uint256 price) internal {
-        // Only update in non-view context (this is a view function, so we can't update state)
-        // This would need to be called from non-view functions
+        _lastValidPrices[token] = price;
+    }
+
+    /**
+     * @dev Staleness threshold for a token: strict mode uses heartbeat + grace,
+     *      normal mode uses the configured (or default) max age.
+     */
+    function _stalenessThreshold(address token) internal view returns (uint256) {
+        FreshnessConfig memory config = _freshnessConfigs[token];
+        if (config.strictMode) {
+            return uint256(config.heartbeat) + config.graceTime;
+        }
+        return config.maxAge > 0 ? config.maxAge : DEFAULT_MAX_AGE;
     }
 
     /**

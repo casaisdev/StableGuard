@@ -10,6 +10,7 @@ import {IRepegManager} from "./interfaces/IRepegManager.sol";
 import {IPriceOracle} from "./interfaces/IPriceOracle.sol";
 import {Timelock} from "./Timelock.sol";
 import {Constants} from "./Constants.sol";
+import {RateLimiter} from "./RateLimiter.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 /**
@@ -24,7 +25,7 @@ contract StableGuard is ERC20, ReentrancyGuard {
         uint64 lastUpdate; // 8 bytes - Last position update timestamp
         uint32 riskScore; // 4 bytes - Cached risk score (scaled)
         uint32 flags; // 4 bytes - Packed flags (liquidatable, emergency, etc.)
-            // Total: 32 bytes (1 storage slot)
+        // Total: 32 bytes (1 storage slot)
     }
 
     struct PackedConfig {
@@ -34,7 +35,7 @@ contract StableGuard is ERC20, ReentrancyGuard {
         uint32 maxLiquidationBonus; // 4 bytes - Max liquidation bonus
         uint32 emergencyDelay; // 4 bytes - Emergency action delay
         uint32 reserved; // 4 bytes - Reserved for future use
-            // Total: 32 bytes (1 storage slot)
+        // Total: 32 bytes (1 storage slot)
     }
 
     struct PackedModules {
@@ -43,41 +44,14 @@ contract StableGuard is ERC20, ReentrancyGuard {
         ILiquidationManager liquidationManager; // 20 bytes
         IDutchAuctionManager dutchAuctionManager; // 20 bytes
         IRepegManager repegManager; // 20 bytes
-            // Total: 100 bytes (4 storage slots)
+        // Total: 100 bytes (5 storage slots, one address per slot)
     }
 
     // ============ CONSTANTS ============
 
-    uint256 private constant RISK_SCALE = 1e4; // For risk score compression
-
-    // ============ RATE LIMITING CONSTANTS ============
-
-    uint256 private constant RATE_LIMIT_WINDOW = 1 hours;
-    uint256 private constant MAX_OPERATIONS_PER_HOUR = 10;
-    uint256 private constant MAX_VOLUME_PER_HOUR = 100000 ether; // 100k USD equivalent
-    uint256 private constant COOLDOWN_PERIOD = 5 minutes;
-    uint256 private constant BURST_LIMIT = 3; // Max operations in burst
-    uint256 private constant BURST_WINDOW = 1 minutes;
-
-    // ============ RATE LIMITING STRUCTS ============
-
-    struct RateLimitData {
-        uint64 lastOperationTime; // 8 bytes - Last operation timestamp
-        uint32 operationCount; // 4 bytes - Operations in current window
-        uint32 burstCount; // 4 bytes - Operations in burst window
-        uint64 windowStart; // 8 bytes - Current window start
-        uint64 burstWindowStart; // 8 bytes - Burst window start
-        uint128 volumeInWindow; // 16 bytes - Volume in current window
-            // Total: 48 bytes (2 storage slots)
-    }
-
-    struct GlobalRateLimit {
-        uint64 lastGlobalOperation; // 8 bytes - Last global operation
-        uint32 globalOperationCount; // 4 bytes - Global operations count
-        uint64 globalWindowStart; // 8 bytes - Global window start
-        uint128 globalVolumeInWindow; // 16 bytes - Global volume in window
-            // Total: 40 bytes (2 storage slots)
-    }
+    // Rate-limiting types, constants, and heavy logic live in the RateLimiter
+    // library (linked externally to keep StableGuard under the size limit).
+    using RateLimiter for mapping(address => RateLimiter.RateLimitData);
 
     // ============ OPTIMIZED STATE ============
 
@@ -96,10 +70,10 @@ contract StableGuard is ERC20, ReentrancyGuard {
     // ============ RATE LIMITING STATE ============
 
     // User-specific rate limiting
-    mapping(address => RateLimitData) private userRateLimits;
+    mapping(address => RateLimiter.RateLimitData) private userRateLimits;
 
     // Global rate limiting
-    GlobalRateLimit private globalRateLimit;
+    RateLimiter.GlobalRateLimit private globalRateLimit;
 
     // Operation type tracking
     mapping(bytes32 => uint256) private operationCounts; // operationType => count
@@ -123,10 +97,8 @@ contract StableGuard is ERC20, ReentrancyGuard {
     );
 
     // ============ RATE LIMITING EVENTS ============
+    // RateLimitExceeded/RateLimitUpdated are emitted from the RateLimiter library.
 
-    event RateLimitExceeded(address indexed user, string operation, uint256 attemptedVolume, uint256 currentCount);
-    event RateLimitUpdated(address indexed user, string operation, uint256 newCount, uint256 newVolume);
-    event GlobalRateLimitExceeded(string operation, uint256 attemptedVolume, uint256 currentCount);
     event RateLimitingPauseChanged(bool paused, address indexed admin);
 
     // ============ REPEG MONITORING EVENTS ============
@@ -155,13 +127,24 @@ contract StableGuard is ERC20, ReentrancyGuard {
         _;
     }
 
+    /// @dev Governance actions must be routed through the Timelock (queue + delay)
+    modifier onlyTimelock() {
+        require(msg.sender == address(TIMELOCK), "Only timelock");
+        _;
+    }
+
     modifier validModules() {
         assembly {
             let modulesSlot := modules.slot
             let oracle := sload(modulesSlot)
             let collateral := sload(add(modulesSlot, 1))
             let liquidation := sload(add(modulesSlot, 2))
-            if or(or(iszero(oracle), iszero(collateral)), iszero(liquidation)) {
+            let dutchAuction := sload(add(modulesSlot, 3))
+            let repeg := sload(add(modulesSlot, 4))
+            if or(
+                or(or(iszero(oracle), iszero(collateral)), or(iszero(liquidation), iszero(dutchAuction))),
+                iszero(repeg)
+            ) {
                 mstore(0x00, 0xd92e233d) // "Invalid modules"
                 revert(0x1c, 0x04)
             }
@@ -190,7 +173,8 @@ contract StableGuard is ERC20, ReentrancyGuard {
         address _collateralManager,
         address _liquidationManager,
         address _dutchAuctionManager,
-        address _repegManager
+        address _repegManager,
+        address _timelock
     ) ERC20("StableGuard", "SGD") {
         assembly {
             if or(
@@ -198,7 +182,7 @@ contract StableGuard is ERC20, ReentrancyGuard {
                     or(iszero(_priceOracle), iszero(_collateralManager)),
                     or(iszero(_liquidationManager), iszero(_dutchAuctionManager))
                 ),
-                iszero(_repegManager)
+                or(iszero(_repegManager), iszero(_timelock))
             ) {
                 mstore(0x00, 0xd92e233d) // "Invalid addresses"
                 revert(0x1c, 0x04)
@@ -206,7 +190,9 @@ contract StableGuard is ERC20, ReentrancyGuard {
         }
 
         OWNER = msg.sender;
-        TIMELOCK = new Timelock(2 days); // 2 day delay for emergency operations
+        // The Timelock is deployed separately (owned by the deployer/multisig) and
+        // wired in here, so governance changes actually pass through its delay.
+        TIMELOCK = Timelock(payable(_timelock));
 
         // Initialize ultra-packed modules
         modules = PackedModules({
@@ -349,6 +335,7 @@ contract StableGuard is ERC20, ReentrancyGuard {
             modules.collateralManager.getUserCollateral(msg.sender, token) >= withdrawAmount, "Insufficient collateral"
         );
         if (!isEth) require(modules.priceOracle.isSupportedToken(token), "Token not supported");
+        require(modules.dutchAuctionManager.getUserTokenAuction(msg.sender, token) == 0, "Collateral in auction");
 
         // Calculate new position values
         uint256 currentCollateralValue = modules.collateralManager.getTotalCollateralValue(msg.sender);
@@ -377,18 +364,8 @@ contract StableGuard is ERC20, ReentrancyGuard {
         }
 
         // ============ INTERACTIONS ============
-        // Withdraw collateral (external call)
-        modules.collateralManager.withdraw(msg.sender, token, withdrawAmount);
-
-        // Forward collateral from StableGuard to the user
-        if (isEth) {
-            require(address(this).balance >= withdrawAmount, "Insufficient ETH for forward");
-            (bool success,) = payable(msg.sender).call{value: withdrawAmount}("");
-            require(success, "ETH forward failed");
-        } else {
-            require(IERC20(token).balanceOf(address(this)) >= withdrawAmount, "Insufficient tokens for forward");
-            require(IERC20(token).transfer(msg.sender, withdrawAmount), "Transfer failed");
-        }
+        // Withdraw collateral straight to the user (CollateralManager pays recipient)
+        modules.collateralManager.withdraw(msg.sender, token, withdrawAmount, msg.sender);
 
         emit PositionUpdated(msg.sender, newDebt, newCollateralValue);
     }
@@ -422,8 +399,11 @@ contract StableGuard is ERC20, ReentrancyGuard {
             totalCollateralNeeded := add(debtAmount, liquidationBonus)
         }
 
+        // Convert the USD value (debt + bonus, 1e18) into a token amount
+        uint256 collateralTokenAmount =
+            modules.priceOracle.getTokenAmountFromUsd(collateralToken, totalCollateralNeeded);
         require(
-            modules.collateralManager.getUserCollateral(user, collateralToken) >= totalCollateralNeeded,
+            modules.collateralManager.getUserCollateral(user, collateralToken) >= collateralTokenAmount,
             "Insufficient collateral"
         );
         // Use external self-call so spender is the contract, matching allowance pattern
@@ -449,16 +429,10 @@ contract StableGuard is ERC20, ReentrancyGuard {
         }
 
         // ============ INTERACTIONS ============
-        modules.collateralManager.withdraw(user, collateralToken, totalCollateralNeeded);
-        // Forward collateral from StableGuard to liquidator
-        if (collateralToken == Constants.ETH_TOKEN) {
-            (bool success,) = payable(msg.sender).call{value: totalCollateralNeeded}("");
-            require(success, "ETH forward failed");
-        } else {
-            require(IERC20(collateralToken).transfer(msg.sender, totalCollateralNeeded), "Transfer failed");
-        }
+        // Seize collateral straight to the liquidator (CollateralManager pays recipient)
+        modules.collateralManager.withdraw(user, collateralToken, collateralTokenAmount, msg.sender);
 
-        emit PositionLiquidated(user, msg.sender, debtAmount, totalCollateralNeeded);
+        emit PositionLiquidated(user, msg.sender, debtAmount, collateralTokenAmount);
     }
 
     // Accept ETH from CollateralManager for withdrawals and liquidations
@@ -517,61 +491,61 @@ contract StableGuard is ERC20, ReentrancyGuard {
     }
 
     /**
-     * @dev Emergency direct liquidation (owner only)
+     * @dev Emergency direct liquidation (owner only). The owner supplies the SGD
+     *      being retired so the supply stays backed: transfer in, single debt
+     *      decrement, single burn, and equivalent collateral (no bonus) is
+     *      seized to the owner.
      */
-    function emergencyLiquidate(address user, uint256 debtAmount) external onlyOwner validModules validPosition(user) {
+    function emergencyLiquidate(address user, address token, uint256 debtAmount)
+        external
+        onlyOwner
+        validModules
+        validPosition(user)
+        nonReentrant
+    {
         // ============ CHECKS ============
-        require(debtAmount > 0 && positions[user].debt >= debtAmount, "Invalid debt amount");
+        UserPosition storage position = positions[user];
+        require(debtAmount > 0 && position.debt >= debtAmount, "Invalid debt amount");
+
+        // Owner provides the SGD to retire (spender is the contract itself)
+        require(this.transferFrom(msg.sender, address(this), debtAmount), "Transfer failed");
 
         // ============ EFFECTS ============
-        // Update position
-        UserPosition storage position = positions[user];
         position.debt = uint128(position.debt - debtAmount);
         position.lastUpdate = uint64(block.timestamp);
-
-        // Burn liquidated debt
         _burn(address(this), debtAmount);
 
         // ============ INTERACTIONS ============
-        // Perform emergency liquidation
-        bool success = modules.liquidationManager.liquidateDirect(user, debtAmount);
-        require(success, "Liquidation failed");
+        // Seize equivalent collateral (capped at the user's balance) to the owner
+        uint256 collateralAmount = modules.priceOracle.getTokenAmountFromUsd(token, debtAmount);
+        uint256 available = modules.collateralManager.getUserCollateral(user, token);
+        if (collateralAmount > available) collateralAmount = available;
+        if (collateralAmount > 0) {
+            modules.collateralManager.withdraw(user, token, collateralAmount, OWNER);
+        }
 
         emit PositionUpdated(user, position.debt, modules.collateralManager.getTotalCollateralValue(user));
     }
 
     /**
-     * @dev Process auction completion (called by DutchAuctionManager)
+     * @dev Process auction completion (called by DutchAuctionManager). The auction
+     *      manager transfers the settled SGD to this contract before calling; the
+     *      amount is clamped to the outstanding debt so a rounding residue or a
+     *      concurrent partial liquidation can never block settlement.
      */
-    function processAuctionCompletion(address user, uint256 debtAmount) external {
+    function processAuctionCompletion(address user, uint256 debtAmount) external nonReentrant {
         require(msg.sender == address(modules.dutchAuctionManager), "Only auction manager");
-        require(positions[user].debt >= debtAmount, "Invalid debt amount");
+
+        UserPosition storage position = positions[user];
+        uint256 settled = debtAmount > position.debt ? position.debt : debtAmount;
+        if (settled == 0) return;
 
         // Update position
-        UserPosition storage position = positions[user];
-        position.debt = uint128(position.debt - debtAmount);
+        position.debt = uint128(position.debt - settled);
         position.lastUpdate = uint64(block.timestamp);
 
         // Burn liquidated debt
-        _burn(address(this), debtAmount);
-
-        emit PositionUpdated(user, position.debt, modules.collateralManager.getTotalCollateralValue(user));
-    }
-
-    /**
-     * @dev Process direct liquidation completion (called by LiquidationManager)
-     */
-    function processDirectLiquidation(address user, uint256 debtAmount) external {
-        require(msg.sender == address(modules.liquidationManager), "Only liquidation manager");
-        require(positions[user].debt >= debtAmount, "Invalid debt amount");
-
-        // Update position
-        UserPosition storage position = positions[user];
-        position.debt = uint128(position.debt - debtAmount);
-        position.lastUpdate = uint64(block.timestamp);
-
-        // Burn liquidated debt held by StableGuard
-        _burn(address(this), debtAmount);
+        _burn(address(this), settled);
 
         emit PositionUpdated(user, position.debt, modules.collateralManager.getTotalCollateralValue(user));
     }
@@ -583,7 +557,7 @@ contract StableGuard is ERC20, ReentrancyGuard {
     // Cache for expensive external calls
     mapping(address => uint256) private _collateralValueCache;
     mapping(address => uint256) private _cacheTimestamp;
-    uint256 private constant CACHE_DURATION = 300; // 5 minutes
+    uint256 private constant COLLATERAL_CACHE_DURATION = 300; // 5 minutes
 
     /**
      * @dev Get user position (ultra-optimized)
@@ -596,7 +570,7 @@ contract StableGuard is ERC20, ReentrancyGuard {
      * @dev Get cached collateral value or fetch if expired
      */
     function _getCachedCollateralValue(address user) internal returns (uint256) {
-        if (block.timestamp - _cacheTimestamp[user] < CACHE_DURATION) {
+        if (block.timestamp - _cacheTimestamp[user] < COLLATERAL_CACHE_DURATION) {
             return _collateralValueCache[user];
         }
         return modules.collateralManager.getTotalCollateralValue(user);
@@ -723,23 +697,11 @@ contract StableGuard is ERC20, ReentrancyGuard {
      * @dev Fast liquidation threshold calculation
      */
     function getLiquidationThreshold(address user) external view returns (uint256) {
-        uint256 debt;
-        uint256 threshold;
-        uint256 basisPoints = Constants.BASIS_POINTS;
-        assembly {
-            mstore(0x00, user)
-            mstore(0x20, positions.slot)
-            let positionSlot := keccak256(0x00, 0x40)
-            debt := sload(positionSlot)
-            if iszero(debt) {
-                mstore(0x00, 0)
-                return(0x00, 0x20)
-            }
-            threshold := sload(add(config.slot, 1))
-            let result := div(mul(debt, threshold), basisPoints)
-            mstore(0x00, result)
-            return(0x00, 0x20)
-        }
+        // Plain Solidity on purpose: the previous assembly read config.slot + 1,
+        // which is the priceOracle address, not the packed liquidationThreshold.
+        uint256 debt = positions[user].debt;
+        if (debt == 0) return 0;
+        return (debt * config.liquidationThreshold) / Constants.BASIS_POINTS;
     }
 
     function getUserTokens(address user) external view returns (address[] memory) {
@@ -1006,7 +968,7 @@ contract StableGuard is ERC20, ReentrancyGuard {
         address _liquidationManager,
         address _dutchAuctionManager,
         address _repegManager
-    ) external onlyOwner {
+    ) external onlyTimelock {
         require(
             _priceOracle != address(0) && _collateralManager != address(0) && _liquidationManager != address(0)
                 && _dutchAuctionManager != address(0) && _repegManager != address(0),
@@ -1036,7 +998,7 @@ contract StableGuard is ERC20, ReentrancyGuard {
 
     function updateConfig(uint64 _minCollateralRatio, uint64 _liquidationThreshold, uint32 _emergencyThreshold)
         external
-        onlyOwner
+        onlyTimelock
     {
         require(
             _minCollateralRatio > _liquidationThreshold && _liquidationThreshold > _emergencyThreshold
@@ -1057,124 +1019,18 @@ contract StableGuard is ERC20, ReentrancyGuard {
 
     // ============ RATE LIMITING FUNCTIONS ============
 
-    /**
-     * @dev Check and update rate limits for user operations
-     * @param user User address
-     * @param operation Operation type
-     * @param volume Operation volume in USD
-     * @return allowed Whether operation is allowed
-     */
-    function _checkRateLimit(address user, string memory operation, uint256 volume) internal returns (bool allowed) {
-        if (rateLimitingPaused) return true;
-
-        RateLimitData storage userLimit = userRateLimits[user];
-        uint256 currentTime = block.timestamp;
-
-        // Reset window if expired
-        if (currentTime >= userLimit.windowStart + RATE_LIMIT_WINDOW) {
-            userLimit.windowStart = uint64(currentTime);
-            userLimit.operationCount = 0;
-            userLimit.volumeInWindow = 0;
-        }
-
-        // Reset burst window if expired
-        if (currentTime >= userLimit.burstWindowStart + BURST_WINDOW) {
-            userLimit.burstWindowStart = uint64(currentTime);
-            userLimit.burstCount = 0;
-        }
-
-        // Check burst limit
-        if (userLimit.burstCount >= BURST_LIMIT) {
-            emit RateLimitExceeded(user, operation, volume, userLimit.burstCount);
-            return false;
-        }
-
-        // Check hourly limits
-        if (
-            userLimit.operationCount >= MAX_OPERATIONS_PER_HOUR
-                || userLimit.volumeInWindow + volume > MAX_VOLUME_PER_HOUR
-        ) {
-            emit RateLimitExceeded(user, operation, volume, userLimit.operationCount);
-            return false;
-        }
-
-        // Check cooldown
-        if (currentTime < userLimit.lastOperationTime + COOLDOWN_PERIOD) {
-            emit RateLimitExceeded(user, operation, volume, userLimit.operationCount);
-            return false;
-        }
-
-        // All rate limit checks passed - update limits
-        userLimit.lastOperationTime = uint64(currentTime);
-        userLimit.operationCount++;
-        userLimit.burstCount++;
-        userLimit.volumeInWindow += uint128(volume);
-
-        emit RateLimitUpdated(user, operation, userLimit.operationCount, userLimit.volumeInWindow);
-        return true;
-    }
-
-    /**
-     * @dev Update global rate limits
-     * @param operation Operation type
-     * @param volume Operation volume
-     */
-    function _updateGlobalRateLimit(string memory operation, uint256 volume) internal {
-        if (rateLimitingPaused) return;
-
-        uint256 currentTime = block.timestamp;
-
-        // Reset global window if expired
-        if (currentTime >= globalRateLimit.globalWindowStart + RATE_LIMIT_WINDOW) {
-            globalRateLimit.globalWindowStart = uint64(currentTime);
-            globalRateLimit.globalOperationCount = 0;
-            globalRateLimit.globalVolumeInWindow = 0;
-        }
-
-        // Update global counters
-        globalRateLimit.lastGlobalOperation = uint64(currentTime);
-        globalRateLimit.globalOperationCount++;
-        globalRateLimit.globalVolumeInWindow += uint128(volume);
-
-        // Update operation type counter
-        bytes32 operationHash;
-        assembly {
-            let ptr := mload(0x40)
-            let len := mload(operation)
-            mstore(ptr, len)
-            let dataPtr := add(operation, 0x20)
-            for { let i := 0 } lt(i, len) { i := add(i, 0x20) } {
-                mstore(add(ptr, add(0x20, i)), mload(add(dataPtr, i)))
-            }
-            operationHash := keccak256(add(ptr, 0x20), len)
-        }
-        operationCounts[operationHash]++;
-    }
-
     // ============ RATE LIMITING MODIFIERS ============
 
     modifier rateLimited(string memory operation, uint256 volume) {
         if (!rateLimitingPaused) {
-            require(_checkRateLimit(msg.sender, operation, volume), "Rate limit exceeded");
+            require(userRateLimits.checkAndConsume(msg.sender, operation, volume), "Rate limit exceeded");
         }
         _;
     }
 
     modifier globalRateLimited(string memory operation, uint256 volume) {
         if (!rateLimitingPaused) {
-            uint256 currentTime = block.timestamp;
-            uint256 globalMaxOps = MAX_OPERATIONS_PER_HOUR * 100; // 100x user limit for global
-
-            // Check if global window needs reset
-            if (currentTime >= globalRateLimit.globalWindowStart + RATE_LIMIT_WINDOW) {
-                globalRateLimit.globalWindowStart = uint64(currentTime);
-                globalRateLimit.globalOperationCount = 0;
-                globalRateLimit.globalVolumeInWindow = 0;
-            }
-
-            require(globalRateLimit.globalOperationCount < globalMaxOps, "Global rate limit exceeded");
-
-            _updateGlobalRateLimit(operation, volume);
+            RateLimiter.consumeGlobal(globalRateLimit, operationCounts, operation, volume);
         }
         _;
     }
@@ -1183,74 +1039,40 @@ contract StableGuard is ERC20, ReentrancyGuard {
 
     /**
      * @dev Get user rate limit data
-     * @param user User address
-     * @return Rate limit data for user
      */
-    function getUserRateLimit(address user) external view returns (RateLimitData memory) {
+    function getUserRateLimit(address user) external view returns (RateLimiter.RateLimitData memory) {
         return userRateLimits[user];
     }
 
     /**
      * @dev Get global rate limit data
-     * @return Global rate limit data
      */
-    function getGlobalRateLimit() external view returns (GlobalRateLimit memory) {
+    function getGlobalRateLimit() external view returns (RateLimiter.GlobalRateLimit memory) {
         return globalRateLimit;
     }
 
     /**
      * @dev Get operation count for specific operation type
-     * @param operation Operation type string
-     * @return Operation count
      */
     function getOperationCount(string memory operation) external view returns (uint256) {
-        bytes32 operationHash;
-        assembly {
-            let ptr := mload(0x40)
-            let len := mload(operation)
-            mstore(ptr, len)
-            let dataPtr := add(operation, 0x20)
-            for { let i := 0 } lt(i, len) { i := add(i, 0x20) } {
-                mstore(add(ptr, add(0x20, i)), mload(add(dataPtr, i)))
-            }
-            operationHash := keccak256(add(ptr, 0x20), len)
-        }
-        return operationCounts[operationHash];
+        return operationCounts[keccak256(bytes(operation))];
     }
 
     /**
      * @dev Check if user can perform operation
-     * @param user User address
-     * @param volume Operation volume
-     * @return Whether operation is allowed
      */
-    function checkRateLimitStatus(address user, string memory, /* operation */ uint256 volume)
+    function checkRateLimitStatus(
+        address user,
+        string memory,
+        /* operation */
+        uint256 volume
+    )
         external
         view
         returns (bool)
     {
         if (rateLimitingPaused) return true;
-
-        RateLimitData memory userLimit = userRateLimits[user];
-        uint256 currentTime = block.timestamp;
-
-        // Simulate window reset
-        if (currentTime >= userLimit.windowStart + RATE_LIMIT_WINDOW) {
-            userLimit.operationCount = 0;
-            userLimit.volumeInWindow = 0;
-        }
-
-        // Simulate burst window reset
-        if (currentTime >= userLimit.burstWindowStart + BURST_WINDOW) {
-            userLimit.burstCount = 0;
-        }
-
-        // Check all limits
-        return (
-            userLimit.burstCount < BURST_LIMIT && userLimit.operationCount < MAX_OPERATIONS_PER_HOUR
-                && userLimit.volumeInWindow + volume <= MAX_VOLUME_PER_HOUR
-                && currentTime >= userLimit.lastOperationTime + COOLDOWN_PERIOD
-        );
+        return userRateLimits.status(user, volume);
     }
 
     // ============ RATE LIMITING ADMIN FUNCTIONS ============
@@ -1270,7 +1092,6 @@ contract StableGuard is ERC20, ReentrancyGuard {
      */
     function resetUserRateLimit(address user) external onlyOwner {
         delete userRateLimits[user];
-        emit RateLimitUpdated(user, "RESET", 0, 0);
     }
 
     /**
@@ -1280,29 +1101,7 @@ contract StableGuard is ERC20, ReentrancyGuard {
         delete globalRateLimit;
     }
 
-    // ============ INTERNAL RATE LIMITING FUNCTIONS ============
-
-    /**
-     * @dev Update user rate limits
-     * @param user User address
-     * @param operation Operation type
-     * @param volume Operation volume
-     * @return Whether update was successful
-     */
-    function _updateUserRateLimit(address user, string memory operation, uint256 volume) internal returns (bool) {
-        RateLimitData storage userLimit = userRateLimits[user];
-        uint256 currentTime = block.timestamp;
-
-        userLimit.lastOperationTime = uint64(currentTime);
-        userLimit.operationCount++;
-        userLimit.burstCount++;
-        userLimit.volumeInWindow += uint128(volume);
-
-        emit RateLimitUpdated(user, operation, userLimit.operationCount, userLimit.volumeInWindow);
-        return true;
-    }
-
-    // ============ REPEG MONAGEMENT FUNCTIONS ============
+    // ============ REPEG MANAGEMENT FUNCTIONS ============
 
     /**
      * @dev Trigger automatic repeg check and execution
@@ -1315,7 +1114,8 @@ contract StableGuard is ERC20, ReentrancyGuard {
 
         emit RepegMonitoring(msg.sender, 1, deviation, incentive, block.timestamp);
 
-        return modules.repegManager.checkAndTriggerRepeg();
+        // The caller is forwarded so the incentive reaches them, not this contract
+        return modules.repegManager.checkAndTriggerRepeg(msg.sender);
     }
 
     /**
@@ -1349,10 +1149,10 @@ contract StableGuard is ERC20, ReentrancyGuard {
     }
 
     /**
-     * @dev Update repeg configuration (owner only)
+     * @dev Update repeg configuration (via Timelock)
      * @param newConfig New repeg configuration
      */
-    function updateRepegConfig(IRepegManager.RepegConfig calldata newConfig) external onlyOwner validModules {
+    function updateRepegConfig(IRepegManager.RepegConfig calldata newConfig) external onlyTimelock validModules {
         modules.repegManager.updateRepegConfig(newConfig);
 
         emit RepegConfigUpdated(msg.sender, newConfig.deviationThreshold, newConfig.incentiveRate, false);
@@ -1401,41 +1201,9 @@ contract StableGuard is ERC20, ReentrancyGuard {
         return modules.repegManager.executeArbitrage{value: msg.value}(amount, maxSlippage);
     }
 
-    /**
-     * @dev Provide liquidity to repeg pool
-     * @param amount Amount of liquidity to provide
-     * @return success Whether liquidity provision was successful
-     */
-    function provideRepegLiquidity(uint256 amount) external payable validModules nonReentrant returns (bool success) {
-        (uint256 totalLiquidity,) = modules.repegManager.getLiquidityPoolStatus();
-
-        success = modules.repegManager.provideLiquidity{value: msg.value}(amount);
-
-        if (success) {
-            emit RepegLiquidityOperation(msg.sender, true, amount, totalLiquidity + amount);
-            emit RepegMonitoring(msg.sender, 3, 0, uint128(amount), block.timestamp);
-        }
-
-        return success;
-    }
-
-    /**
-     * @dev Withdraw liquidity from repeg pool
-     * @param amount Amount of liquidity to withdraw
-     * @return success Whether liquidity withdrawal was successful
-     */
-    function withdrawRepegLiquidity(uint256 amount) external validModules nonReentrant returns (bool success) {
-        (uint256 totalLiquidity,) = modules.repegManager.getLiquidityPoolStatus();
-
-        success = modules.repegManager.withdrawLiquidity(amount);
-
-        if (success) {
-            emit RepegLiquidityOperation(msg.sender, false, amount, totalLiquidity - amount);
-            emit RepegMonitoring(msg.sender, 3, 0, uint128(amount), block.timestamp);
-        }
-
-        return success;
-    }
+    // NOTE: liquidity is provided/withdrawn directly on the RepegManager so the
+    // provider is credited correctly; forwarding through this contract would
+    // credit the liquidity to StableGuard instead of the user.
 
     /**
      * @dev Get liquidity pool status

@@ -30,7 +30,3 @@ yarn-error.log*
 # Coverage reports
 coverage/
 
-# Vendor dependencies (Foundry)
-lib/
-
-.gitmodules

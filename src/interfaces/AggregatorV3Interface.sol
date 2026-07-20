@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.13;
+pragma solidity ^0.8.19;
 
 /// @title AggregatorV3Interface
 /// @notice Interface for accessing detailed data from an aggregator contract, including round data and metadata.

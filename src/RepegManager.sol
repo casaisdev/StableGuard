@@ -29,7 +29,7 @@ contract RepegManager is ReentrancyGuard, Ownable, IRepegManager {
         uint128 priceBuffer; // 16 bytes
         uint64 lastEmergencyTime; // 8 bytes
         uint8 historyIndex; // 1 byte
-            // 6 bytes padding
+        // 6 bytes padding
     }
 
     // Pack price history entry (32 bytes)
@@ -48,6 +48,7 @@ contract RepegManager is ReentrancyGuard, Ownable, IRepegManager {
     error TransferFailed();
     error InsufficientLiquidity();
     error RepegInProgress();
+    error EmergencyPaused();
     error ArbitrageWindowExpired();
 
     // ============ IMMUTABLES ============
@@ -60,10 +61,13 @@ contract RepegManager is ReentrancyGuard, Ownable, IRepegManager {
     IRepegManager.RepegConfig private _config;
     IRepegManager.RepegState private _state;
 
-    // Liquidity management
-    uint256 private _totalLiquidity;
+    // Liquidity management: ETH and SGD are tracked separately so each provider
+    // is repaid in the asset they deposited.
+    uint256 private _totalEthLiquidity;
+    uint256 private _totalSgdLiquidity;
     uint256 private _reservedLiquidity;
-    mapping(address => uint256) private _liquidityProviders;
+    mapping(address => uint256) private _ethLiquidity;
+    mapping(address => uint256) private _sgdLiquidity;
 
     // Gas optimized packed data
     PackedEmergencyData private _emergencyData;
@@ -74,9 +78,13 @@ contract RepegManager is ReentrancyGuard, Ownable, IRepegManager {
     // Uniswap router addresses - Using V2 only
     address private constant UNISWAP_V2_ROUTER = Constants.UNISWAP_V2_ROUTER;
 
-    // Arbitrage tracking
+    // Arbitrage tracking. Reputation is a score used for the incentive bonus —
+    // NOT a claimable balance (the contract never owes these amounts).
     IRepegManager.ArbitrageOpportunity[] private _arbitrageOpportunities;
-    mapping(address => uint256) private _arbitrageurs;
+    mapping(address => uint256) private _arbitrageurReputation;
+
+    // Effective incentive cap, adjustable up to MAX_INCENTIVE
+    uint128 private _maxIncentive = uint128(MAX_INCENTIVE);
 
     // Optimized repeg history (circular buffer for gas efficiency)
     PackedPriceHistory[50] private _priceHistory;
@@ -119,7 +127,7 @@ contract RepegManager is ReentrancyGuard, Ownable, IRepegManager {
     }
 
     modifier notPaused() {
-        if (_emergencyData.emergencyPaused) revert RepegInProgress();
+        if (_emergencyData.emergencyPaused) revert EmergencyPaused();
         _;
     }
 
@@ -270,15 +278,19 @@ contract RepegManager is ReentrancyGuard, Ownable, IRepegManager {
     // ============ CORE REPEG FUNCTIONS ============
 
     /// @inheritdoc IRepegManager
-    function checkAndTriggerRepeg()
+    /// @dev Only callable through StableGuard, which passes the end user as the
+    ///      beneficiary so the incentive reaches the actual caller.
+    function checkAndTriggerRepeg(address beneficiary)
         external
         override
+        onlyStableGuard
         notPaused
         nonReentrant
         circuitBreakerCheck
         returns (bool triggered, uint128 newPrice)
     {
         require(_config.enabled, "Repeg disabled");
+        if (beneficiary == address(0)) revert InvalidAddress();
 
         // Update daily counter if needed
         _updateDailyCounter();
@@ -298,7 +310,7 @@ contract RepegManager is ReentrancyGuard, Ownable, IRepegManager {
         (uint128 targetPrice, uint8 direction, uint128 incentive) = calculateRepegParameters();
 
         // Apply arbitrageur bonus if applicable
-        if (incentive > 0 && _arbitrageurs[msg.sender] > 0) {
+        if (incentive > 0 && _arbitrageurReputation[beneficiary] > 0) {
             incentive = uint128((incentive * 110) / 100); // 10% bonus
         }
 
@@ -308,15 +320,13 @@ contract RepegManager is ReentrancyGuard, Ownable, IRepegManager {
         // Execute repeg
         bool success = _executeRepegInternal(targetPrice, direction);
         if (success) {
-            // Pay incentive to caller
-            if (incentive > 0 && _totalLiquidity >= incentive) {
-                _payIncentive(msg.sender, incentive);
-            }
+            // Pay incentive to the beneficiary (pays only if the SGD pool covers it)
+            _payIncentive(beneficiary, incentive);
 
             triggered = true;
             newPrice = targetPrice;
 
-            emit RepegEvent(0, priceBeforeRepeg, targetPrice, msg.sender, incentive, uint32(block.timestamp));
+            emit RepegEvent(0, priceBeforeRepeg, targetPrice, beneficiary, incentive, uint32(block.timestamp));
         }
 
         return (triggered, newPrice);
@@ -366,13 +376,13 @@ contract RepegManager is ReentrancyGuard, Ownable, IRepegManager {
 
             // incentive = (deviation * incentiveRate * totalLiquidity) / (BASIS_POINTS * BASIS_POINTS)
             incentive = uint128(
-                (deviation * _config.incentiveRate * _totalLiquidity)
+                (deviation * _config.incentiveRate * _totalLiquidityView())
                     / (Constants.BASIS_POINTS * Constants.BASIS_POINTS)
             );
 
-            // Cap incentive at maximum
-            if (incentive > MAX_INCENTIVE) {
-                incentive = uint128(MAX_INCENTIVE);
+            // Cap incentive at the configured maximum
+            if (incentive > _maxIncentive) {
+                incentive = _maxIncentive;
             }
         }
     }
@@ -405,38 +415,58 @@ contract RepegManager is ReentrancyGuard, Ownable, IRepegManager {
     // ============ LIQUIDITY MANAGEMENT ============
 
     /// @inheritdoc IRepegManager
+    /// @dev ETH (msg.value) and SGD deposits are tracked in separate pools so
+    ///      each provider is repaid in the asset they deposited.
     function provideLiquidity(uint256 amount) external payable override nonReentrant returns (bool success) {
         if (amount == 0) revert InvalidParameters();
 
-        // Handle ETH or token deposits
         if (msg.value > 0) {
             if (msg.value != amount) revert InvalidParameters();
-            amount = msg.value;
+            _ethLiquidity[msg.sender] += amount;
+            _totalEthLiquidity += amount;
         } else {
             bool transferSuccess = STABLE_TOKEN.transferFrom(msg.sender, address(this), amount);
             if (!transferSuccess) revert TransferFailed();
+            _sgdLiquidity[msg.sender] += amount;
+            _totalSgdLiquidity += amount;
         }
-
-        // Update liquidity tracking
-        _liquidityProviders[msg.sender] += amount;
-        _totalLiquidity += amount;
 
         return true;
     }
 
     /// @inheritdoc IRepegManager
+    /// @dev Withdraws from the caller's SGD pool; use withdrawEthLiquidity for ETH
     function withdrawLiquidity(uint256 amount) external override nonReentrant returns (bool success) {
         if (amount == 0) revert InvalidParameters();
-        if (_liquidityProviders[msg.sender] < amount) revert InsufficientLiquidity();
-        if (_totalLiquidity - _reservedLiquidity < amount) revert InsufficientLiquidity();
+        if (_sgdLiquidity[msg.sender] < amount) revert InsufficientLiquidity();
+        if (_totalSgdLiquidity < amount || _totalLiquidityView() - _reservedLiquidity < amount) {
+            revert InsufficientLiquidity();
+        }
 
         // Update state
-        _liquidityProviders[msg.sender] -= amount;
-        _totalLiquidity -= amount;
+        _sgdLiquidity[msg.sender] -= amount;
+        _totalSgdLiquidity -= amount;
 
         // Transfer funds
         bool transferSuccess = STABLE_TOKEN.transfer(msg.sender, amount);
         if (!transferSuccess) revert TransferFailed();
+
+        return true;
+    }
+
+    /// @inheritdoc IRepegManager
+    function withdrawEthLiquidity(uint256 amount) external override nonReentrant returns (bool success) {
+        if (amount == 0) revert InvalidParameters();
+        if (_ethLiquidity[msg.sender] < amount) revert InsufficientLiquidity();
+        if (_totalEthLiquidity < amount || address(this).balance < amount) revert InsufficientLiquidity();
+
+        // Update state
+        _ethLiquidity[msg.sender] -= amount;
+        _totalEthLiquidity -= amount;
+
+        // Transfer funds
+        (bool ok,) = payable(msg.sender).call{value: amount}("");
+        if (!ok) revert TransferFailed();
 
         return true;
     }
@@ -452,7 +482,9 @@ contract RepegManager is ReentrancyGuard, Ownable, IRepegManager {
         nonReentrant
         returns (uint128 profit)
     {
-        if (amount == 0 || maxSlippage > Constants.REPEG_DEVIATION_THRESHOLD * 2) revert InvalidParameters(); // Max 10% slippage
+        if (amount == 0 || maxSlippage > Constants.REPEG_DEVIATION_THRESHOLD * 2) {
+            revert InvalidParameters(); // Max 10% slippage
+        }
 
         // Get current price before arbitrage (use cached version)
         uint128 priceBefore = _getCurrentMarketPriceCached();
@@ -504,10 +536,10 @@ contract RepegManager is ReentrancyGuard, Ownable, IRepegManager {
                     // Update price state
                     _state.currentPrice = priceAfter;
 
-                    // Update arbitrageur tracking
-                    _arbitrageurs[msg.sender] += profit;
+                    // Reputation score only — never a claimable balance
+                    _arbitrageurReputation[msg.sender] += profit;
 
-                    emit ArbitrageExecuted(block.timestamp);
+                    emit RepegArbitrageExecuted(block.timestamp);
                 }
             }
         } catch {
@@ -539,8 +571,9 @@ contract RepegManager is ReentrancyGuard, Ownable, IRepegManager {
 
     /// @inheritdoc IRepegManager
     function updateIncentiveParameters(uint16 rate, uint128 maxIncentive) external override onlyOwner {
-        if (rate > 1000 || maxIncentive > MAX_INCENTIVE) revert InvalidParameters(); // Max 10% rate
+        if (rate > 1000 || maxIncentive == 0 || maxIncentive > MAX_INCENTIVE) revert InvalidParameters(); // Max 10% rate
         _config.incentiveRate = rate;
+        _maxIncentive = maxIncentive;
     }
 
     // ============ VIEW FUNCTIONS ============
@@ -650,14 +683,15 @@ contract RepegManager is ReentrancyGuard, Ownable, IRepegManager {
         if (deviation == 0) return 0;
 
         incentive = uint128(
-            (deviation * _config.incentiveRate * _totalLiquidity) / (Constants.BASIS_POINTS * Constants.BASIS_POINTS)
+            (deviation * _config.incentiveRate * _totalLiquidityView())
+                / (Constants.BASIS_POINTS * Constants.BASIS_POINTS)
         );
-        if (incentive > MAX_INCENTIVE) {
-            incentive = uint128(MAX_INCENTIVE);
+        if (incentive > _maxIncentive) {
+            incentive = _maxIncentive;
         }
 
         // Bonus for frequent arbitrageurs
-        if (_arbitrageurs[caller] > 0) {
+        if (_arbitrageurReputation[caller] > 0) {
             incentive = uint128((incentive * 110) / 100); // 10% bonus
         }
     }
@@ -669,8 +703,8 @@ contract RepegManager is ReentrancyGuard, Ownable, IRepegManager {
         override
         returns (uint256 totalLiquidity, uint256 availableLiquidity)
     {
-        totalLiquidity = _totalLiquidity;
-        availableLiquidity = _totalLiquidity - _reservedLiquidity;
+        totalLiquidity = _totalLiquidityView();
+        availableLiquidity = totalLiquidity - _reservedLiquidity;
     }
 
     /// @inheritdoc IRepegManager
@@ -711,7 +745,7 @@ contract RepegManager is ReentrancyGuard, Ownable, IRepegManager {
             return (false, "Repeg not needed");
         }
 
-        if (_totalLiquidity < MIN_LIQUIDITY) {
+        if (_totalLiquidityView() < MIN_LIQUIDITY) {
             return (false, "Insufficient liquidity");
         }
 
@@ -726,7 +760,7 @@ contract RepegManager is ReentrancyGuard, Ownable, IRepegManager {
 
         // Confidence based on price stability and liquidity
         uint128 currentDeviation = _getCurrentDeviation();
-        uint256 liquidityRatio = (_totalLiquidity * 100) / MIN_LIQUIDITY;
+        uint256 liquidityRatio = (_totalLiquidityView() * 100) / MIN_LIQUIDITY;
 
         confidence = uint32((10000 - currentDeviation) * liquidityRatio / 100);
         if (confidence > 10000) confidence = 10000;
@@ -839,20 +873,29 @@ contract RepegManager is ReentrancyGuard, Ownable, IRepegManager {
         uint128, /* targetPrice */
         uint256 interventionAmount,
         uint8 direction
-    ) internal pure returns (uint128) {
+    )
+        internal
+        pure
+        returns (uint128)
+    {
         // Simulate market response to intervention
         uint256 priceImpact = (interventionAmount * 50) / (10000 * Constants.PRICE_PRECISION); // 0.5% impact per 10k intervention
 
+        // Direction convention (shared across the contract): 1 = buy SGD (price
+        // below target, intervention pushes it UP), 2 = sell SGD (pushes it DOWN).
         if (direction == 1) {
-            // Sell pressure
-            return uint128(prePrice - (prePrice * priceImpact) / Constants.BASIS_POINTS);
-        } else {
-            // Buy pressure
             return uint128(prePrice + (prePrice * priceImpact) / Constants.BASIS_POINTS);
+        } else {
+            return uint128(prePrice - (prePrice * priceImpact) / Constants.BASIS_POINTS);
         }
     }
 
-    function _adaptInterventionStrategy(bool wasEffective, uint128, /* preDeviation */ uint128 postDeviation)
+    function _adaptInterventionStrategy(
+        bool wasEffective,
+        uint128,
+        /* preDeviation */
+        uint128 postDeviation
+    )
         internal
     {
         // Adaptive parameter adjustment (simplified for testnet)
@@ -893,7 +936,7 @@ contract RepegManager is ReentrancyGuard, Ownable, IRepegManager {
     function _executeArbitrageIfProfitable() internal {
         try ARBITRAGE_MANAGER.executeArbitrage() {
             // Arbitrage executed successfully
-            emit ArbitrageExecuted(block.timestamp);
+            emit RepegArbitrageExecuted(block.timestamp);
         } catch {
             // Arbitrage failed or no profitable opportunities
             // Continue with normal repeg operations
@@ -962,10 +1005,10 @@ contract RepegManager is ReentrancyGuard, Ownable, IRepegManager {
         }
 
         // Liquidity-based adjustment
-        if (_totalLiquidity < 5000 * Constants.PRICE_PRECISION) {
+        if (_totalLiquidityView() < 5000 * Constants.PRICE_PRECISION) {
             // Low liquidity
             baseThreshold = (baseThreshold * 75) / 100; // More sensitive (decrease by 25%)
-        } else if (_totalLiquidity > 50000 * Constants.PRICE_PRECISION) {
+        } else if (_totalLiquidityView() > 50000 * Constants.PRICE_PRECISION) {
             // High liquidity
             baseThreshold = (baseThreshold * 110) / 100; // Less sensitive (increase by 10%)
         }
@@ -1021,12 +1064,18 @@ contract RepegManager is ReentrancyGuard, Ownable, IRepegManager {
         _historyIndex = (_historyIndex + 1) % 50;
     }
 
+    /// @dev Combined liquidity across both pools (nominal units)
+    function _totalLiquidityView() internal view returns (uint256) {
+        return _totalEthLiquidity + _totalSgdLiquidity;
+    }
+
     function _payIncentive(address recipient, uint128 amount) internal {
-        if (amount > 0 && _totalLiquidity >= amount) {
+        // Incentives are paid in SGD, so they must be covered by the SGD pool
+        if (amount > 0 && _totalSgdLiquidity >= amount) {
             _reservedLiquidity += amount;
             bool success = STABLE_TOKEN.transfer(recipient, amount);
             if (success) {
-                _totalLiquidity -= amount;
+                _totalSgdLiquidity -= amount;
             }
             _reservedLiquidity -= amount;
         }
@@ -1063,11 +1112,18 @@ contract RepegManager is ReentrancyGuard, Ownable, IRepegManager {
 
     // ============ REPEG OPERATION FUNCTIONS ============
 
-    function _calculateInterventionAmount(uint128 deviation, uint8 /* direction */ ) internal view returns (uint256) {
+    function _calculateInterventionAmount(
+        uint128 deviation,
+        uint8 /* direction */
+    )
+        internal
+        view
+        returns (uint256)
+    {
         // Advanced PID-like controller for price stabilization
 
         // Proportional component - immediate response to current deviation
-        uint256 proportional = (_totalLiquidity * deviation) / (Constants.BASIS_POINTS * 8);
+        uint256 proportional = (_totalLiquidityView() * deviation) / (Constants.BASIS_POINTS * 8);
 
         // Integral component - accumulated error over time (consecutive repegs)
         uint256 integral = (proportional * _state.consecutiveRepegs * 300) / Constants.BASIS_POINTS; // 3% per consecutive repeg
@@ -1099,28 +1155,34 @@ contract RepegManager is ReentrancyGuard, Ownable, IRepegManager {
 
     function _calculateDynamicMaxIntervention(uint128 deviation) internal view returns (uint256) {
         // Base maximum: 10% of total liquidity
-        uint256 baseMax = _totalLiquidity / 10;
+        uint256 baseMax = _totalLiquidityView() / 10;
 
         // Increase maximum for larger deviations (emergency situations)
         if (deviation > 500) {
             // > 5% deviation
-            baseMax = (_totalLiquidity * 15) / 100; // 15% max
+            baseMax = (_totalLiquidityView() * 15) / 100; // 15% max
         } else if (deviation > 200) {
             // > 2% deviation
-            baseMax = (_totalLiquidity * 12) / 100; // 12% max
+            baseMax = (_totalLiquidityView() * 12) / 100; // 12% max
         }
 
         // Reduce maximum if liquidity is low
-        if (_totalLiquidity < 10000 * Constants.PRICE_PRECISION) {
+        if (_totalLiquidityView() < 10000 * Constants.PRICE_PRECISION) {
             baseMax = baseMax / 2; // Conservative approach with low liquidity
         }
 
         return baseMax;
     }
 
-    function _executeBuyPressure(uint128, /* targetPrice */ uint256 amount) internal {
-        // Real buy pressure using Uniswap V2
-        if (amount > 0 && _totalLiquidity >= amount && address(this).balance >= amount) {
+    function _executeBuyPressure(
+        uint128,
+        /* targetPrice */
+        uint256 amount
+    )
+        internal
+    {
+        // Real buy pressure using Uniswap V2: spends ETH liquidity, receives SGD
+        if (amount > 0 && _totalEthLiquidity >= amount && address(this).balance >= amount) {
             // Get quote from Uniswap V2 for pricing
             uint256 expectedTokens = _getUniswapV2Quote(Constants.WETH, address(STABLE_TOKEN), amount);
 
@@ -1145,8 +1207,9 @@ contract RepegManager is ReentrancyGuard, Ownable, IRepegManager {
                 uint256[] memory amounts = abi.decode(result, (uint256[]));
                 uint256 tokensReceived = amounts[amounts.length - 1];
 
-                // Update internal tracking
-                _totalLiquidity += amount;
+                // ETH spent, SGD received
+                _totalEthLiquidity -= amount;
+                _totalSgdLiquidity += tokensReceived;
                 _state.currentPrice = _getCurrentMarketPrice();
 
                 emit BuyPressureExecuted(amount, tokensReceived, _state.currentPrice);
@@ -1154,7 +1217,13 @@ contract RepegManager is ReentrancyGuard, Ownable, IRepegManager {
         }
     }
 
-    function _executeSellPressure(uint128, /* targetPrice */ uint256 amount) internal {
+    function _executeSellPressure(
+        uint128,
+        /* targetPrice */
+        uint256 amount
+    )
+        internal
+    {
         uint256 stableBalance = STABLE_TOKEN.balanceOf(address(this));
 
         if (amount > 0 && stableBalance >= amount) {
@@ -1185,10 +1254,9 @@ contract RepegManager is ReentrancyGuard, Ownable, IRepegManager {
                 uint256[] memory amounts = abi.decode(result, (uint256[]));
                 uint256 ethReceived = amounts[amounts.length - 1];
 
-                // Update internal tracking
-                if (_totalLiquidity > ethReceived) {
-                    _totalLiquidity -= ethReceived;
-                }
+                // SGD spent, ETH received
+                _totalSgdLiquidity = _totalSgdLiquidity >= amount ? _totalSgdLiquidity - amount : 0;
+                _totalEthLiquidity += ethReceived;
                 _state.currentPrice = _getCurrentMarketPrice();
 
                 emit SellPressureExecuted(amount, ethReceived, _state.currentPrice);
@@ -1218,19 +1286,14 @@ contract RepegManager is ReentrancyGuard, Ownable, IRepegManager {
         }
     }
 
-    function _updateLiquidityReserves(uint256 amount, uint8 direction) internal {
-        // Update liquidity reserves based on operation
-        if (direction == 0) {
-            // Buy pressure - liquidity used to buy stable tokens
-            if (_totalLiquidity >= amount) {
-                _totalLiquidity -= amount;
-            }
-        } else {
-            // Sell pressure - received assets from selling stable tokens
-            _totalLiquidity += amount;
-        }
-
-        // Reset reserved liquidity
+    function _updateLiquidityReserves(
+        uint256 amount,
+        uint8 /* direction */
+    )
+        internal
+    {
+        // Pool balances are updated inside _executeBuyPressure/_executeSellPressure
+        // with the actual swap amounts; here we only release the reservation.
         if (_reservedLiquidity >= amount) {
             _reservedLiquidity -= amount;
         } else {
@@ -1241,7 +1304,7 @@ contract RepegManager is ReentrancyGuard, Ownable, IRepegManager {
     // ============ EMERGENCY FUNCTIONS ============
 
     /// @dev Emergency withdrawal function (owner only)
-    function emergencyWithdraw() external onlyOwner {
+    function emergencyWithdraw() external override onlyOwner {
         uint256 balance = STABLE_TOKEN.balanceOf(address(this));
         if (balance > 0) {
             require(STABLE_TOKEN.transfer(owner(), balance), "Transfer failed");
@@ -1250,11 +1313,19 @@ contract RepegManager is ReentrancyGuard, Ownable, IRepegManager {
         if (address(this).balance > 0) {
             payable(owner()).transfer(address(this).balance);
         }
+
+        // The pools are drained: reflect it in the accounting
+        _totalEthLiquidity = 0;
+        _totalSgdLiquidity = 0;
+        _reservedLiquidity = 0;
     }
 
-    /// @dev Receive ETH for liquidity provision
+    /// @dev Accept ETH only from swap flows (router unwinding to ETH) and the
+    ///      ArbitrageManager. Plain sends do NOT credit liquidity — use
+    ///      provideLiquidity for that.
     receive() external payable {
-        _liquidityProviders[msg.sender] += msg.value;
-        _totalLiquidity += msg.value;
+        if (msg.sender != UNISWAP_V2_ROUTER && msg.sender != address(ARBITRAGE_MANAGER)) {
+            revert Unauthorized();
+        }
     }
 }

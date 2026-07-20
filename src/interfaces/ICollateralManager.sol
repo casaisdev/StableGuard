@@ -19,25 +19,19 @@ interface ICollateralManager {
 
     event Deposit(address indexed user, address indexed token, uint256 amount);
     event Withdraw(address indexed user, address indexed token, uint256 amount);
+    event AuthorizedManagerSet(address indexed manager, bool authorized);
 
     // ============ CORE FUNCTIONS ============
 
-    /// @dev Add a new collateral type
-    function addCollateralType(
-        address token,
-        address priceFeed,
-        uint256 fallbackPrice,
-        uint8 decimals,
-        uint16 ltv,
-        uint16 liquidationThreshold,
-        uint16 liquidationPenalty
-    ) external;
+    /// @dev Add a new collateral type. Risk parameters live in StableGuard's config.
+    function addCollateralType(address token, address priceFeed, uint256 fallbackPrice, uint8 decimals) external;
 
     /// @dev Unified deposit for ETH and ERC20 tokens
     function deposit(address user, address token, uint256 amount) external payable;
 
-    /// @dev Unified withdraw for ETH and ERC20 tokens
-    function withdraw(address user, address token, uint256 amount) external;
+    /// @dev Unified withdraw for ETH and ERC20 tokens. Debits `user`'s custody and
+    ///      pays `recipient` directly. Restricted to authorized managers.
+    function withdraw(address user, address token, uint256 amount, address recipient) external;
 
     // ============ VIEW FUNCTIONS ============
 

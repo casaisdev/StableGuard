@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {console2} from "forge-std/console2.sol";
 import {PriceOracle} from "../src/PriceOracle.sol";
 import {AggregatorV3Interface} from "../src/interfaces/AggregatorV3Interface.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
 contract MockAggregatorV3 is AggregatorV3Interface {
     int256 private _price;
@@ -12,6 +13,7 @@ contract MockAggregatorV3 is AggregatorV3Interface {
     uint256 private _version;
     string private _description;
     uint80 private _roundId;
+    uint256 private _updatedAt; // 0 = always fresh (mirrors block.timestamp)
 
     constructor(int256 price, uint8 decimals_) {
         _price = price;
@@ -39,7 +41,8 @@ contract MockAggregatorV3 is AggregatorV3Interface {
         override
         returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound)
     {
-        return (_roundId_, _price, block.timestamp, block.timestamp, _roundId_);
+        uint256 ts = _updatedAt == 0 ? block.timestamp : _updatedAt;
+        return (_roundId_, _price, ts, ts, _roundId_);
     }
 
     function latestRoundData()
@@ -48,12 +51,17 @@ contract MockAggregatorV3 is AggregatorV3Interface {
         override
         returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound)
     {
-        return (_roundId, _price, block.timestamp, block.timestamp, _roundId);
+        uint256 ts = _updatedAt == 0 ? block.timestamp : _updatedAt;
+        return (_roundId, _price, ts, ts, _roundId);
     }
 
     function setPrice(int256 newPrice) external {
         _price = newPrice;
         _roundId++;
+    }
+
+    function setUpdatedAt(uint256 newUpdatedAt) external {
+        _updatedAt = newUpdatedAt;
     }
 }
 
@@ -75,7 +83,7 @@ contract PriceOracleTest is Test {
     }
 
     function testDeployment() public view {
-        assertEq(priceOracle.OWNER(), owner);
+        assertEq(priceOracle.owner(), owner);
         // MIN_VALID_PRICE is a private constant, so we can't access it directly
         // Instead, we'll just verify the contract was deployed successfully
         assertTrue(address(priceOracle) != address(0));
@@ -116,7 +124,7 @@ contract PriceOracleTest is Test {
 
         // Check if we're the owner
         console2.log("- Contract owner:");
-        console2.logAddress(priceOracle.OWNER());
+        console2.logAddress(priceOracle.owner());
         console2.log("- Test contract (msg.sender):");
         console2.logAddress(address(this));
 
@@ -493,36 +501,43 @@ contract PriceOracleTest is Test {
 
         priceOracle.configureToken(tokenAddress, address(mockAggregator), 1000 * 1e18, 18);
 
-        console2.log("1. Fresh price (recently updated):");
+        // Fresh price is served from Chainlink
         mockAggregator.setPrice(2000 * 1e8);
-        uint256 freshPrice = priceOracle.getTokenPrice(tokenAddress);
-        console2.log("   Fresh price in USD:");
-        console2.logUint(freshPrice / 1e18);
+        assertEq(priceOracle.getTokenPrice(tokenAddress), 2000 * 1e18);
 
-        // Simulate time passed (in a real test you'd use vm.warp)
-        console2.log("2. Verifying time validations:");
-        (uint80 roundId, int256 answer,, uint256 updatedAt, uint80 answeredInRound) = mockAggregator.latestRoundData();
+        // Freeze the feed's timestamp and warp past the 1h staleness threshold:
+        // the oracle must reject the stale reading and serve the fallback price.
+        mockAggregator.setUpdatedAt(block.timestamp);
+        vm.warp(block.timestamp + 3601);
+        assertEq(priceOracle.getTokenPrice(tokenAddress), 1000 * 1e18, "Stale price must fall back");
 
-        console2.log("   Round ID:");
-        console2.logUint(roundId);
-        console2.log("   Answer:");
-        console2.logUint(uint256(answer));
-        console2.log("   Updated at:");
-        console2.logUint(updatedAt);
-        console2.log("   Current time:");
-        console2.logUint(block.timestamp);
-        console2.log("   Time difference in seconds:");
-        console2.logUint(block.timestamp - updatedAt);
-        console2.log("   Answered in round:");
-        console2.logUint(answeredInRound);
-
-        // Verify that the data is valid
-        assertTrue(roundId > 0);
-        assertTrue(answer > 0);
-        assertTrue(updatedAt > 0);
-        assertTrue(block.timestamp - updatedAt <= 3600); // Less than 1 hour
+        // A refreshed feed is accepted again
+        mockAggregator.setUpdatedAt(0); // always fresh
+        assertEq(priceOracle.getTokenPrice(tokenAddress), 2000 * 1e18);
 
         console2.log("Freshness validations work");
+    }
+
+    /**
+     * @dev Deviation tracking: 10-50% moves are accepted but emit an event
+     */
+    function testPriceDeviationEvent() public {
+        priceOracle.configureToken(tokenAddress, address(mockAggregator), 1000 * 1e18, 18);
+
+        // Seed last valid price
+        mockAggregator.setPrice(2000 * 1e8);
+        assertEq(priceOracle.getTokenPrice(tokenAddress), 2000 * 1e18);
+
+        // A 20% move is accepted but reported (>10% threshold), comparing against
+        // the PREVIOUS valid price
+        mockAggregator.setPrice(2400 * 1e8);
+        vm.expectEmit(true, false, false, true);
+        emit PriceOracle.PriceDeviationDetected(tokenAddress, 2000 * 1e18, 2400 * 1e18, 2000);
+        assertEq(priceOracle.getTokenPrice(tokenAddress), 2400 * 1e18);
+
+        // A >50% move from the last valid price (2400) is rejected -> fallback
+        mockAggregator.setPrice(4000 * 1e8);
+        assertEq(priceOracle.getTokenPrice(tokenAddress), 1000 * 1e18, "Deviation guard must fall back");
     }
 
     /**
@@ -584,7 +599,7 @@ contract PriceOracleTest is Test {
         console2.log("- MockAggregator deployed at:");
         console2.logAddress(address(mockAggregator));
         console2.log("- Contract owner:");
-        console2.logAddress(priceOracle.OWNER());
+        console2.logAddress(priceOracle.owner());
 
         console2.log("CAPABILITIES:");
         console2.log("- Integration with Chainlink: YES");
@@ -599,7 +614,7 @@ contract PriceOracleTest is Test {
         console2.log("- The contract will automatically handle real prices");
 
         assertTrue(address(priceOracle) != address(0));
-        assertTrue(priceOracle.OWNER() == address(this));
+        assertTrue(priceOracle.owner() == address(this));
     }
 
     // ============ FUZZING TESTS ============
@@ -658,7 +673,10 @@ contract PriceOracleTest is Test {
      */
     function testFuzz_DecimalConversion(uint8 fuzzDecimals, int256 fuzzPrice) public {
         vm.assume(fuzzDecimals > 0 && fuzzDecimals <= 18);
-        vm.assume(fuzzPrice > 0 && fuzzPrice <= type(int128).max);
+        // Converted price must clear the oracle's dust floor (MIN_VALID_PRICE = 1e14,
+        // i.e. $0.0001 in 1e18): raw price >= 10^(decimals-4)
+        int256 minRaw = fuzzDecimals >= 4 ? int256(10 ** (fuzzDecimals - 4)) : int256(1);
+        fuzzPrice = bound(fuzzPrice, minRaw, type(int128).max);
 
         // Create aggregator with fuzzed decimals
         MockAggregatorV3 fuzzAggregator = new MockAggregatorV3(fuzzPrice, fuzzDecimals);
@@ -746,10 +764,13 @@ contract PriceOracleTest is Test {
     }
 
     /**
-     * @dev Invariant: Owner must always remain the same
+     * @dev Ownership is now OZ Ownable (transferable). A non-owner cannot change it.
      */
-    function invariant_OwnerNeverChanges() public view {
-        assertEq(priceOracle.OWNER(), address(this), "Owner should never change");
+    function test_OwnershipAccessControl() public {
+        address notOwner = makeAddr("notOwner");
+        vm.prank(notOwner);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, notOwner));
+        priceOracle.transferOwnership(notOwner);
     }
 
     /**
@@ -806,16 +827,23 @@ contract PriceOracleTest is Test {
         console2.log("Normal price in USD:");
         console2.logUint(normalPrice / 1e18);
 
-        // Simulate hyperinflation: price rises 10000%
+        // A sudden 10000% spike trips the deviation guard: the oracle rejects the
+        // reading and falls back to the stored fallback price.
         mockAggregator.setPrice(200000 * 1e8); // $200,000
-        uint256 inflatedPrice = priceOracle.getTokenPrice(tokenAddress);
-        console2.log("Hyperinflated price in USD:");
-        console2.logUint(inflatedPrice / 1e18);
+        uint256 guardedPrice = priceOracle.getTokenPrice(tokenAddress);
+        assertEq(guardedPrice, 1000 * 1e18, "Spike must be rejected in favor of fallback");
 
-        assertTrue(inflatedPrice > normalPrice);
-        assertTrue(inflatedPrice > 0);
+        // A gradual climb (steps of exactly +50%, the guard's limit) is accepted.
+        uint256 rawPrice = 2000 * 1e8;
+        for (uint256 i = 0; i < 12; i++) {
+            rawPrice = (rawPrice * 3) / 2;
+            mockAggregator.setPrice(int256(rawPrice));
+            assertEq(priceOracle.getTokenPrice(tokenAddress), rawPrice * 1e10);
+        }
 
-        console2.log("System handles hyperinflation correctly");
+        // The price surpassed the original 100x target, just not in a single jump
+        assertTrue(rawPrice * 1e10 > normalPrice * 100);
+        console2.log("Deviation guard blocks spikes but tracks gradual hyperinflation");
     }
 
     /**
@@ -973,8 +1001,9 @@ contract PriceOracleTest is Test {
      * @dev Property test: Prices should be monotonic with respect to the input
      */
     function testProperty_PriceMonotonicity(int256 price1, int256 price2) public {
-        vm.assume(price1 > 0 && price1 < type(int128).max);
-        vm.assume(price2 > 0 && price2 < type(int128).max);
+        // 1e4 raw at 8 feed decimals = 1e14 converted = the oracle's dust floor
+        price1 = bound(price1, 1e4, type(int128).max);
+        price2 = bound(price2, 1e4, type(int128).max);
         vm.assume(price1 != price2);
 
         // Configure two tokens with different prices

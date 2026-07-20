@@ -54,9 +54,6 @@ contract TimelockTest is Test {
         // Fund timelock with ETH for testing
         vm.deal(address(timelock), 100 ether);
         vm.deal(OWNER, 100 ether);
-
-        // Set up invariant testing
-        targetContract(address(timelock));
     }
 
     // ============ BASIC FUNCTIONALITY TESTS ============
@@ -640,6 +637,7 @@ contract ReentrancyAttacker {
 contract TimelockInvariantTest is StdInvariant, Test {
     Timelock public timelock;
     MockTarget public mockTarget;
+    TimelockDelayHandler public delayHandler;
 
     address public constant OWNER = address(0x1);
     uint256 public constant DEFAULT_DELAY = 2 days;
@@ -653,9 +651,10 @@ contract TimelockInvariantTest is StdInvariant, Test {
         mockTarget = new MockTarget();
         vm.stopPrank();
 
-        // Setup for invariant testing
-        targetContract(address(timelock));
-        targetSender(OWNER);
+        // Drive the timelock through a handler so the fuzzer actually queues
+        // transactions (queueing is owner-only) and then tries to execute early.
+        delayHandler = new TimelockDelayHandler(timelock, mockTarget, OWNER);
+        targetContract(address(delayHandler));
     }
 
     /**
@@ -674,11 +673,45 @@ contract TimelockInvariantTest is StdInvariant, Test {
     }
 
     /**
-     * @notice Invariant: Reentrancy protection is active
+     * @notice Invariant: no queued transaction can ever execute before its ETA.
+     *         The handler repeatedly queues and tries to execute early; if any
+     *         such early execution ever succeeds, this flips and the invariant fails.
      */
-    function invariant_ReentrancyProtection() public pure {
-        // ReentrancyGuard state should be consistent
-        assertTrue(true, "Reentrancy protection active");
+    function invariant_NoEarlyExecution() public view {
+        assertFalse(delayHandler.earlyExecutionSucceeded(), "A transaction executed before its delay elapsed");
+    }
+}
+
+/// @dev Drives queue -> premature execute attempts against a real Timelock
+contract TimelockDelayHandler is Test {
+    Timelock public timelock;
+    MockTarget public target;
+    address public owner;
+    bool public earlyExecutionSucceeded;
+    uint256 private nonce;
+
+    constructor(Timelock _timelock, MockTarget _target, address _owner) {
+        timelock = _timelock;
+        target = _target;
+        owner = _owner;
+    }
+
+    /// @dev Queue a transaction at the minimum valid ETA and immediately try to
+    ///      execute it; the execution must revert because the delay has not passed.
+    function queueAndTryEarly(uint256 value) external {
+        value = bound(value, 0, type(uint128).max);
+        uint256 eta = block.timestamp + timelock.MINIMUM_DELAY();
+        bytes memory data = abi.encode(value);
+
+        vm.prank(owner);
+        try timelock.queueTransaction(address(target), 0, "setValue(uint256)", data, eta) {
+            // Attempt to execute before the ETA — this must fail
+            vm.prank(owner);
+            try timelock.executeTransaction(address(target), 0, "setValue(uint256)", data, eta) {
+                earlyExecutionSucceeded = true; // Invariant violation
+            } catch {}
+        } catch {}
+        nonce++;
     }
 }
 

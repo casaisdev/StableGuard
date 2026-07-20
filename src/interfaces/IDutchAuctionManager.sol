@@ -7,8 +7,7 @@ interface IDutchAuctionManager {
     error InvalidParameters();
     error InvalidAddress();
     error NoCollateral();
-    error InvalidAuction();
-    error AuctionEnded();
+    error AuctionExpired();
     error AuctionNotExpired();
     error PriceTooHigh();
     error InsufficientPayment();
@@ -27,6 +26,7 @@ interface IDutchAuctionManager {
         uint128 startPrice; // 16 bytes - Start price
         uint128 endPrice; // 16 bytes - End price
         bool active; // 1 byte - Active status
+        uint8 tokenDecimals; // 1 byte - Cached collateral token decimals
     }
 
     // ============ CONSOLIDATED EVENTS ============
@@ -42,7 +42,8 @@ interface IDutchAuctionManager {
 
     // ============ ULTRA-COMPACT FUNCTIONS ============
     function startDutchAuction(address user, address token, uint256 debtAmount) external returns (uint256);
-    function bidOnAuction(uint256 auctionId, uint256 maxPrice) external payable returns (bool);
+    /// @dev Bids are paid in SGD (the stablecoin), never in ETH or the collateral token
+    function bidOnAuction(uint256 auctionId, uint256 maxPrice) external returns (bool);
     function getCurrentPrice(uint256 auctionId) external view returns (uint256);
     function getAuction(uint256 auctionId) external view returns (DutchAuction memory);
     function getActiveAuctions() external view returns (uint256[] memory);

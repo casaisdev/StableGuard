@@ -41,8 +41,9 @@ contract MockERC20 is ERC20 {
         // Make callback to recipient if enabled (for reentrancy testing)
         if (success && enableCallbacks && to.code.length > 0) {
             try IERC20Receiver(to).onTokenReceived(msg.sender, amount) {
-                // Callback succeeded
-            } catch {
+            // Callback succeeded
+            }
+                catch {
                 // Callback failed, but transfer still succeeded
             }
         }
@@ -56,8 +57,9 @@ contract MockERC20 is ERC20 {
         // Make callback to recipient if enabled (for reentrancy testing)
         if (success && enableCallbacks && to.code.length > 0) {
             try IERC20Receiver(to).onTokenReceived(from, amount) {
-                // Callback succeeded
-            } catch {
+            // Callback succeeded
+            }
+                catch {
                 // Callback failed, but transfer still succeeded
             }
         }
@@ -175,6 +177,11 @@ contract MockPriceOracle is IPriceOracle {
         require(supportedTokens[token], "Token not supported");
         uint256 price = prices[token];
         return (amount * price) / (10 ** tokenDecimals[token]);
+    }
+
+    function getTokenAmountFromUsd(address token, uint256 usdValue) external view returns (uint256) {
+        require(supportedTokens[token], "Token not supported");
+        return (usdValue * (10 ** tokenDecimals[token])) / prices[token];
     }
 
     function getTokenConfig(address token)
@@ -334,10 +341,7 @@ contract MockArbitrageManager is IArbitrageManager {
         override
     {
         config = ArbitrageConfig({
-            maxTradeSize: maxTradeSize,
-            minProfitBps: minProfitBps,
-            maxSlippageBps: maxSlippageBps,
-            enabled: enabled
+            maxTradeSize: maxTradeSize, minProfitBps: minProfitBps, maxSlippageBps: maxSlippageBps, enabled: enabled
         });
 
         emit ConfigUpdated(maxTradeSize, minProfitBps, maxSlippageBps, enabled);
@@ -368,14 +372,24 @@ contract MockArbitrageManager is IArbitrageManager {
         uint256, /* amountIn */
         uint256, /* minAmountOut */
         bytes calldata /* data */
-    ) external view returns (uint256 profit) {
+    )
+        external
+        view
+        returns (uint256 profit)
+    {
         if (shouldRevert) {
             revert("Arbitrage failed");
         }
         return profits[msg.sender];
     }
 
-    function calculateArbitrageProfit(address, /* tokenIn */ address, /* tokenOut */ uint256 /* amountIn */ )
+    function calculateArbitrageProfit(
+        address,
+        /* tokenIn */
+        address,
+        /* tokenOut */
+        uint256 /* amountIn */
+    )
         external
         view
         returns (uint256 profit, bool profitable)
@@ -426,11 +440,7 @@ contract MockUniswapRouter {
         liquidityPools[tokenB][tokenA] = liquidity;
     }
 
-    function getAmountsOut(uint256 amountIn, address[] calldata path)
-        external
-        view
-        returns (uint256[] memory amounts)
-    {
+    function getAmountsOut(uint256 amountIn, address[] calldata path) external view returns (uint256[] memory amounts) {
         require(path.length >= 2, "Invalid path");
         require(address(priceOracle) != address(0), "Price oracle not set");
 
@@ -575,7 +585,7 @@ contract MockStableGuard {
     }
 
     function triggerRepeg() external returns (bool triggered, uint128 newPrice) {
-        return repegManager.checkAndTriggerRepeg();
+        return repegManager.checkAndTriggerRepeg(msg.sender);
     }
 }
 
@@ -612,7 +622,7 @@ contract RepegManagerTest is Test {
         uint32 timestamp
     );
 
-    event ArbitrageExecuted(uint256 timestamp);
+    event RepegArbitrageExecuted(uint256 timestamp);
 
     function setUp() public {
         // Setup accounts
@@ -804,13 +814,13 @@ contract RepegManagerTest is Test {
 
         // Try to trigger repeg while paused - should revert
         vm.expectRevert();
-        repegManager.checkAndTriggerRepeg();
+        stableGuard.triggerRepeg();
 
         // Unpause
         repegManager.setEmergencyPause(false);
 
         // Should work now (though may not trigger if no deviation)
-        repegManager.checkAndTriggerRepeg();
+        stableGuard.triggerRepeg();
     }
 
     function test_SetEmergencyPause_RevertUnauthorized() public {
@@ -1050,7 +1060,7 @@ contract RepegManagerTest is Test {
         );
 
         console.log("DEBUG: About to call checkAndTriggerRepeg...");
-        (bool triggered, uint128 newPrice) = repegManager.checkAndTriggerRepeg();
+        (bool triggered, uint128 newPrice) = stableGuard.triggerRepeg();
 
         console.log("DEBUG: Repeg triggered:", triggered);
         console.log("DEBUG: New price:", newPrice);
@@ -1068,7 +1078,7 @@ contract RepegManagerTest is Test {
         // Advance time to invalidate cache and ensure fresh price is fetched
         vm.warp(block.timestamp + 61);
 
-        (bool triggered, uint128 newPrice) = repegManager.checkAndTriggerRepeg();
+        (bool triggered, uint128 newPrice) = stableGuard.triggerRepeg();
 
         assertFalse(triggered);
         assertEq(newPrice, TARGET_PRICE);
@@ -1086,7 +1096,7 @@ contract RepegManagerTest is Test {
         repegManager.setEmergencyPause(true);
 
         vm.expectRevert();
-        repegManager.checkAndTriggerRepeg();
+        stableGuard.triggerRepeg();
     }
 
     function test_ExecuteRepeg_Success() public {
@@ -1352,6 +1362,99 @@ contract RepegManagerTest is Test {
         vm.stopPrank();
     }
 
+    // ============ COHERENCE TESTS (Phase 6 fixes) ============
+
+    function test_CheckAndTriggerRepeg_OnlyStableGuard() public {
+        // A direct caller that is not StableGuard is rejected
+        vm.prank(user1);
+        vm.expectRevert(RepegManager.Unauthorized.selector);
+        repegManager.checkAndTriggerRepeg(user1);
+    }
+
+    function test_EthLiquidity_InAndOut() public {
+        uint256 amount = 5 ether;
+        vm.deal(user1, amount);
+
+        vm.prank(user1);
+        repegManager.provideLiquidity{value: amount}(amount);
+
+        (uint256 total,) = repegManager.getLiquidityPoolStatus();
+        assertEq(total, amount);
+
+        // ETH deposits are withdrawn as ETH, not SGD
+        uint256 balBefore = user1.balance;
+        vm.prank(user1);
+        bool ok = repegManager.withdrawEthLiquidity(amount);
+        assertTrue(ok);
+        assertEq(user1.balance, balBefore + amount);
+    }
+
+    function test_EthLiquidity_CannotWithdrawAsSgd() public {
+        uint256 amount = 5 ether;
+        vm.deal(user1, amount);
+        vm.prank(user1);
+        repegManager.provideLiquidity{value: amount}(amount);
+
+        // The SGD pool is empty, so an SGD withdrawal must revert
+        vm.prank(user1);
+        vm.expectRevert(RepegManager.InsufficientLiquidity.selector);
+        repegManager.withdrawLiquidity(amount);
+    }
+
+    function test_Receive_RejectsArbitrarySender() public {
+        vm.deal(user1, 1 ether);
+        vm.prank(user1);
+        (bool ok,) = address(repegManager).call{value: 1 ether}("");
+        assertFalse(ok, "Plain ETH sends must be rejected; use provideLiquidity");
+    }
+
+    function test_UpdateIncentiveParameters_StoresMaxIncentive() public {
+        // Cap the incentive very low and confirm calculateIncentive honors it
+        stableToken.mint(user1, 1_000_000e18);
+        vm.startPrank(user1);
+        stableToken.approve(address(repegManager), 1_000_000e18);
+        repegManager.provideLiquidity(1_000_000e18);
+        vm.stopPrank();
+
+        repegManager.updateIncentiveParameters(200, 1e18); // max 1 SGD
+
+        uint256 deviatedPrice = TARGET_PRICE * 110 / 100;
+        priceOracle.setPrice(address(stableToken), deviatedPrice);
+        vm.warp(block.timestamp + 61);
+
+        uint128 incentive = repegManager.calculateIncentive(user1);
+        assertLe(incentive, 1e18, "Incentive must respect the configured max");
+    }
+
+    function test_UpdateIncentiveParameters_RevertZeroMax() public {
+        vm.expectRevert(RepegManager.InvalidParameters.selector);
+        repegManager.updateIncentiveParameters(200, 0);
+    }
+
+    function test_Repeg_IncentivePaidToBeneficiary() public {
+        // Fund the SGD pool so the incentive can actually be paid
+        stableToken.mint(user1, 1_000_000e18);
+        vm.startPrank(user1);
+        stableToken.approve(address(repegManager), 1_000_000e18);
+        repegManager.provideLiquidity(1_000_000e18);
+        vm.stopPrank();
+
+        uint256 deviatedPrice = TARGET_PRICE * 110 / 100;
+        priceOracle.setPrice(address(stableToken), deviatedPrice);
+        vm.warp(block.timestamp + 3601);
+
+        // user2 triggers the repeg via StableGuard: the incentive must reach user2,
+        // not StableGuard.
+        uint256 guardBefore = stableToken.balanceOf(address(stableGuard));
+        uint256 user2Before = stableToken.balanceOf(user2);
+
+        vm.prank(user2);
+        stableGuard.triggerRepeg();
+
+        assertEq(stableToken.balanceOf(address(stableGuard)), guardBefore, "Guard must not receive the incentive");
+        assertGt(stableToken.balanceOf(user2), user2Before, "Beneficiary should receive the incentive");
+    }
+
     // ============ SECURITY AND EMERGENCY CONTROL TESTS ============
 
     function test_EmergencyPause_Success() public {
@@ -1361,13 +1464,13 @@ contract RepegManagerTest is Test {
 
         // Verify repeg operations are paused
         vm.startPrank(user1);
-        vm.expectRevert(RepegManager.RepegInProgress.selector);
-        repegManager.checkAndTriggerRepeg();
+        vm.expectRevert(RepegManager.EmergencyPaused.selector);
+        stableGuard.triggerRepeg();
         vm.stopPrank();
 
         // Verify arbitrage operations are paused
         vm.startPrank(user1);
-        vm.expectRevert(RepegManager.RepegInProgress.selector);
+        vm.expectRevert(RepegManager.EmergencyPaused.selector);
         repegManager.executeArbitrage(1 ether, 500);
         vm.stopPrank();
     }
@@ -1444,17 +1547,10 @@ contract RepegManagerTest is Test {
         console.log("DEBUG: Total liquidity available:", totalLiquidity);
         console.log("DEBUG: Available liquidity:", availableLiquidity);
 
-        console.log("DEBUG: About to attempt reentrancy attack...");
-        vm.startPrank(address(malicious));
-
-        // Check malicious contract state
-        console.log("DEBUG: Malicious contract attacking state before:", malicious.attacking());
-
-        // The initial call should succeed, but the reentrancy attack inside onTokenReceived should be blocked
+        // A non-StableGuard caller can't invoke checkAndTriggerRepeg at all
+        vm.prank(address(malicious));
+        vm.expectRevert(RepegManager.Unauthorized.selector);
         malicious.attemptReentrancy();
-        vm.stopPrank();
-
-        console.log("DEBUG: Test completed - initial call succeeded, reentrancy attack was blocked internally");
     }
 
     function test_ReentrancyProtection_ExecuteArbitrage() public {
@@ -1552,7 +1648,7 @@ contract RepegManagerTest is Test {
         // Execute maximum allowed repegs (default is 10)
         for (uint256 i = 0; i < 10; i++) {
             vm.startPrank(user1);
-            repegManager.checkAndTriggerRepeg();
+            stableGuard.triggerRepeg();
             vm.stopPrank();
 
             // Advance time to avoid cooldown
@@ -1561,7 +1657,7 @@ contract RepegManagerTest is Test {
 
         // Next repeg should fail due to daily limit
         vm.startPrank(user1);
-        (bool triggered,) = repegManager.checkAndTriggerRepeg();
+        (bool triggered,) = stableGuard.triggerRepeg();
         assertFalse(triggered, "Repeg should not trigger due to daily limit");
         vm.stopPrank();
     }
@@ -1573,12 +1669,12 @@ contract RepegManagerTest is Test {
 
         // Execute first repeg
         vm.startPrank(user1);
-        repegManager.checkAndTriggerRepeg();
+        stableGuard.triggerRepeg();
         vm.stopPrank();
 
         // Try to execute another repeg immediately (should fail due to cooldown)
         vm.startPrank(user1);
-        (bool triggered,) = repegManager.checkAndTriggerRepeg();
+        (bool triggered,) = stableGuard.triggerRepeg();
         assertFalse(triggered, "Repeg should not trigger due to cooldown");
         vm.stopPrank();
 
@@ -1587,7 +1683,7 @@ contract RepegManagerTest is Test {
 
         // Now repeg should work
         vm.startPrank(user1);
-        repegManager.checkAndTriggerRepeg();
+        stableGuard.triggerRepeg();
         vm.stopPrank();
     }
 
@@ -1599,7 +1695,7 @@ contract RepegManagerTest is Test {
         // Execute multiple consecutive repegs
         for (uint256 i = 0; i < 3; i++) {
             vm.startPrank(user1);
-            repegManager.checkAndTriggerRepeg();
+            stableGuard.triggerRepeg();
             vm.stopPrank();
 
             // Advance time to avoid cooldown but keep deviation
@@ -1732,14 +1828,14 @@ contract RepegManagerTest is Test {
         // Execute maximum repegs for the day
         for (uint256 i = 0; i < 10; i++) {
             vm.startPrank(user1);
-            repegManager.checkAndTriggerRepeg();
+            stableGuard.triggerRepeg();
             vm.stopPrank();
             vm.warp(block.timestamp + 3601); // Advance past cooldown
         }
 
         // Should fail due to daily limit
         vm.startPrank(user1);
-        (bool triggered,) = repegManager.checkAndTriggerRepeg();
+        (bool triggered,) = stableGuard.triggerRepeg();
         assertFalse(triggered, "Repeg should not trigger due to daily limit");
         vm.stopPrank();
 
@@ -1748,7 +1844,7 @@ contract RepegManagerTest is Test {
 
         // Should work again after daily reset
         vm.startPrank(user1);
-        repegManager.checkAndTriggerRepeg();
+        stableGuard.triggerRepeg();
         vm.stopPrank();
     }
 
@@ -1798,7 +1894,7 @@ contract RepegManagerTest is Test {
         uint256 gasBefore = gasleft();
 
         vm.startPrank(user1);
-        repegManager.checkAndTriggerRepeg();
+        stableGuard.triggerRepeg();
         vm.stopPrank();
 
         uint256 gasUsed = gasBefore - gasleft();
@@ -1905,12 +2001,12 @@ contract RepegManagerTest is Test {
 
         // User1 triggers repeg
         vm.startPrank(user1);
-        repegManager.checkAndTriggerRepeg();
+        stableGuard.triggerRepeg();
         vm.stopPrank();
 
         // User2 tries to trigger repeg immediately (should fail due to cooldown)
         vm.startPrank(user2);
-        (bool triggered,) = repegManager.checkAndTriggerRepeg();
+        (bool triggered,) = stableGuard.triggerRepeg();
         assertFalse(triggered, "Repeg should not trigger due to cooldown");
         vm.stopPrank();
 
@@ -1935,44 +2031,24 @@ contract MaliciousReentrancyContract is IERC20Receiver {
     }
 
     function attemptReentrancy() external {
-        console.log("DEBUG: MaliciousReentrancyContract.attemptReentrancy() called");
+        // checkAndTriggerRepeg is now onlyStableGuard: a non-StableGuard caller
+        // (this contract) cannot even enter, so reentrancy is doubly prevented.
         attacking = true;
-        console.log("DEBUG: Set attacking to true, about to call checkAndTriggerRepeg");
-        repegManager.checkAndTriggerRepeg();
-        console.log("DEBUG: checkAndTriggerRepeg call completed without revert");
+        repegManager.checkAndTriggerRepeg(address(this));
     }
 
     // This will be called when tokens are transferred to this contract
-    function onTokenReceived(address _from, uint256 _amount) external override {
-        console.log("DEBUG: MaliciousReentrancyContract.onTokenReceived() called");
-        console.log("DEBUG: From:", _from);
-        console.log("DEBUG: Amount:", _amount);
-        console.log("DEBUG: Attacking state:", attacking);
-
+    function onTokenReceived(address, uint256) external override {
         if (attacking) {
-            console.log("DEBUG: Conditions met, attempting reentrancy attack via onTokenReceived");
             attacking = false; // Prevent infinite recursion
-            // Attempt reentrancy - this should be blocked by nonReentrant modifier
-            repegManager.checkAndTriggerRepeg();
-            console.log("DEBUG: Reentrancy attack via onTokenReceived completed - this should not be reached!");
-        } else {
-            console.log("DEBUG: Not attacking, onTokenReceived callback ignored");
+            repegManager.checkAndTriggerRepeg(address(this));
         }
     }
 
-    // This would be called if the contract receives ETH and tries to re-enter
     receive() external payable {
-        console.log("DEBUG: MaliciousReentrancyContract.receive() called");
-        console.log("DEBUG: Received ETH amount:", msg.value);
-        console.log("DEBUG: Attacking state:", attacking);
-
         if (attacking) {
-            console.log("DEBUG: Conditions met, attempting reentrancy attack via receive");
             attacking = false;
-            repegManager.checkAndTriggerRepeg(); // Attempt reentrancy
-            console.log("DEBUG: Reentrancy attack via receive completed - this should not be reached!");
-        } else {
-            console.log("DEBUG: Not attacking, receive callback ignored");
+            repegManager.checkAndTriggerRepeg(address(this));
         }
     }
 }
